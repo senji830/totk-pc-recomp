@@ -1,5 +1,13 @@
 # TotK Recomp
 
+> [!NOTE]
+> **Patched Community Fork of [valentderah/totk-pc-recomp](https://github.com/valentderah/totk-pc-recomp)**
+>
+> - **Original Author & Upstream Repository:** Valiantsin Dzerakh ([@valentderah](https://github.com/valentderah)) — https://github.com/valentderah/totk-pc-recomp
+> - **Base Upstream Version & Commit:** `0.5.0` ([`afae80c908ab9fc9cdbafa9ed5295c946d80aa21`](https://github.com/valentderah/totk-pc-recomp/commit/afae80c908ab9fc9cdbafa9ed5295c946d80aa21))
+> - **Original License & Credits:** Preserved intact under the original [MIT License](LICENSE) (`Copyright (c) 2026 Valiantsin Dzerakh`) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) (crediting LAS Recomp, MacNativeGames, d2r-mobile, nxnative, SavageWindRecomp, Ryujinx, deko3d, hactool, RenoDX, SDL 3, Dear ImGui, AMD FidelityFX, VMA, libopus, libvpx, Zstandard, and all other upstream contributors).
+> - **Patches Included in This Fork:** See [PATCHES.md](PATCHES.md) for the 4 runtime bug fixes (ability scan-wave glitch `#1064`, Reflex + `frame_queue=1` swap pacing & FPS overlay accuracy, zero-overhead Shrine R32F floor flicker fix `#530`/`#1134`, and non-blocking pipeline cache autosave on non-Intel GPUs `#681`).
+
 **TotK Recomp** is a static recompilation of *The Legend of Zelda: Tears of the Kingdom* (Nintendo Switch, 2023) into a native x86-64 application for Windows and Linux ([docs/architecture.md](docs/architecture.md)).
 
 > [!IMPORTANT]
