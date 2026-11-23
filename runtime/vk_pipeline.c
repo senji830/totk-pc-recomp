@@ -107,6 +107,7 @@ static struct {
 // Intel's Windows driver (101.7085, Iris Xe) faults in it (igvk64.dll, reading 0x170) when the first autosave meets the
 // boot's pipeline builds (#681). Nothing is taken while it is held.
 static PlatMutex cache_use = PLAT_MUTEX_INIT;
+static int cache_sync;   // Intel igvk64.dll workaround (#681): lock cache_use around vkGetPipelineCacheData only on Intel GPUs
 
 typedef struct Layout {
     struct Layout *next;
@@ -171,6 +172,7 @@ static void cache_path_init(void) {
 
 // Cache data whose header names another device or driver is dropped before Vulkan sees it.
 static void cache_load(VkCtx *c) {
+    cache_sync = c->props.vendorID == 0x8086;
     cache_path_init();
     void *data = NULL;
     size_t size = 0;
@@ -1533,9 +1535,9 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     if (k->fbl & 1) pi.flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
     if (k->fbl & 2) pi.flags |= VK_PIPELINE_CREATE_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
     uint64_t p0 = perf_begin();
-    plat_mutex_lock_shared(&cache_use);
+    if (cache_sync) plat_mutex_lock_shared(&cache_use);
     VkResult r = vkCreateGraphicsPipelines(P.device, P.cache, 1, &pi, NULL, &pipe);
-    plat_mutex_unlock_shared(&cache_use);
+    if (cache_sync) plat_mutex_unlock_shared(&cache_use);
     perf_end(PERF_PIPE, p0);   // counts on the render thread only, so background builds stay out of it
     if (r != VK_SUCCESS) {
         rt_log("vk_pipeline: vkCreateGraphicsPipelines failed (%d)", (int)r);
@@ -1686,9 +1688,9 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
         ri.depthAttachmentFormat = (VkFormat)k->depth, ri.stencilAttachmentFormat = (VkFormat)k->stencil;
         pi.pColorBlendState = &cb, pi.pMultisampleState = &ms;
     }
-    plat_mutex_lock_shared(&cache_use);
+    if (cache_sync) plat_mutex_lock_shared(&cache_use);
     if (vkCreateGraphicsPipelines(P.device, P.cache, 1, &pi, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
-    plat_mutex_unlock_shared(&cache_use);
+    if (cache_sync) plat_mutex_unlock_shared(&cache_use);
 out:
     if (m) vkDestroyShaderModule(P.device, m, NULL);
     free(patched);
@@ -2623,9 +2625,9 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
                                       .layout = l->layout};
     pin_subgroup32(&ci.stage, &rqc, code, words);
     VkPipeline pipe = VK_NULL_HANDLE;
-    plat_mutex_lock_shared(&cache_use);
+    if (cache_sync) plat_mutex_lock_shared(&cache_use);
     if (vkCreateComputePipelines(P.device, P.cache, 1, &ci, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
-    plat_mutex_unlock_shared(&cache_use);
+    if (cache_sync) plat_mutex_unlock_shared(&cache_use);
     vkDestroyShaderModule(P.device, m, NULL);
     return pipe;
 }
@@ -3457,26 +3459,41 @@ static void cache_save(int wait) {
         return;
     }
     uint64_t t0 = qpc();
-    if (wait) {
-        plat_mutex_lock(&cache_use);
-    } else {
-        // The autosave never queues for cache_use: a queued exclusive request on an SRW lock holds back new shared
-        // ones, so the drawing thread's next build would wait for a worker's build to end. It tries for about 2 s
-        // and otherwise saves on its next round.
-        int got = 0;
-        for (int i = 0; i < 1000 && !(got = plat_mutex_trylock(&cache_use)); i++) plat_sleep_ms(2);
-        if (!got) {
-            rt_log("vk_pipeline: cache save put off, pipelines were being built for %.0f ms", ms_since(t0));
-            plat_mutex_unlock(&save_lock);
-            return;
+    int locked = 0;
+    if (cache_sync) {
+        if (wait) {
+            plat_mutex_lock(&cache_use);
+            locked = 1;
+        } else {
+            // The autosave never queues for cache_use: a queued exclusive request on an SRW lock holds back new shared
+            // ones, so the drawing thread's next build would wait for a worker's build to end. It tries for about 2 s
+            // and otherwise saves on its next round.
+            int got = 0;
+            for (int i = 0; i < 1000 && !(got = plat_mutex_trylock(&cache_use)); i++) plat_sleep_ms(2);
+            if (!got) {
+                rt_log("vk_pipeline: cache save put off, pipelines were being built for %.0f ms", ms_since(t0));
+                plat_mutex_unlock(&save_lock);
+                return;
+            }
+            locked = 1;
         }
     }
     uint64_t t1 = qpc();
     size_t size = 0;
     void *data = NULL;
-    int ok = vkGetPipelineCacheData(P.device, P.cache, &size, NULL) == VK_SUCCESS && size && (data = malloc(size)) &&
-             vkGetPipelineCacheData(P.device, P.cache, &size, data) == VK_SUCCESS;
-    plat_mutex_unlock(&cache_use);
+    int ok = 0;
+    for (int attempt = 0; attempt < 3 && !ok; attempt++) {
+        if (vkGetPipelineCacheData(P.device, P.cache, &size, NULL) != VK_SUCCESS || !size) break;
+        size_t cap = locked ? size : size + (size >> 4) + 65536;
+        void *buf = realloc(data, cap);
+        if (!buf) break;
+        data = buf;
+        size_t got_sz = cap;
+        VkResult r = vkGetPipelineCacheData(P.device, P.cache, &got_sz, data);
+        if (r == VK_SUCCESS) { size = got_sz; ok = 1; }
+        else if (r != VK_INCOMPLETE) break;
+    }
+    if (locked) plat_mutex_unlock(&cache_use);
     // The copy time is how long a pipeline build on the drawing thread (a compute miss, under P.lock) can wait for
     // this save; the wait is how long the save waited for builds in flight.
     rt_log("vk_pipeline: cache %s: %.1f MB copied in %.1f ms, after %.1f ms waiting for builds", wait ? "save" : "autosave",
@@ -3489,14 +3506,14 @@ static void cache_save(int wait) {
 void vk_pipeline_save(void) { cache_save(1); }
 
 // The game never shuts the device down (boot.c and the window end the process), so the cache is saved while it
-// runs: at most every 20 s, and only after new pipelines were built. New pipeline keys are appended every 2 s.
+// runs: at most every 60 s, and only after new pipelines were built. New pipeline keys are appended every 2 s.
 static void autosave_once(void) {
     static uint64_t last_n, last_ms, last_keys;
     if (!P.ready) return;
     uint64_t now = plat_now_ms();
     if (*(volatile uint32_t *)&K.pend_n && now - last_keys >= 2000) last_keys = now, keys_flush();
     gfx_shader_record_flush(0);
-    if (now - last_ms < 20000) return;
+    if (now - last_ms < 60000) return;
     VkPipeStats s;
     vk_pipeline_stats(&s);
     if (s.graphics + s.compute == last_n) return;
