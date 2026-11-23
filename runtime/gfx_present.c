@@ -124,6 +124,10 @@ double gfx_window_refresh_hz(void) { return plat_cas32(&g_rate_mhz, 0, 0) / 1000
 
 // ---- swapchain and present state (g_pl)
 static PlatRMutex g_pl;
+// Protects g_sc lifetime against destruction/recreation (exclusive in build_swapchain/release; shared in
+// vk_reflex_sleep/vk_reflex_marker so Reflex sleeps never block present_main or input polling on g_pl).
+// Lock order: g_pl -> g_sc_rw -> g_ql.
+static PlatMutex g_sc_rw = PLAT_MUTEX_INIT;
 static VkSwapchainKHR g_sc;
 static VkFormat g_sc_fmt;
 static int g_sc_hdr;                        // HDR10 (TOTK_HDR, vk_hdr.c): PQ code values in Rec. 2020
@@ -150,7 +154,8 @@ static int g_cap_w, g_cap_h, g_cap_valid;
 static int g_flip_n;
 static uint32_t g_flip_idx[2];
 static int g_flip_gen[2];          // that blit shows a generated picture: its present carries no present ID
-static volatile int64_t g_shown;   // presents queued since the start (gfx_presents_shown)
+static volatile int64_t g_shown;          // presents queued since the start (gfx_presents_shown)
+static volatile int64_t g_last_flip_ns;   // wall time of the last non-generated flip (gfx_last_flip_ns)
 static int g_overlay_on;           // the pair's generated picture laid the menu out: the game's frame draws it again
 static int g_fg_images = -1;       // the swapchain was built with frame generation's extra image (build_swapchain)
 
@@ -320,13 +325,17 @@ static void reflex_apply_locked(void) {
     }
     int mode = reflex_mode_from_cfg();
     uint32_t min_us = 0;
-    // The driver's sleep holds frames to the same rate as the pacer (frame_rate.c frame_step_limit_hz): the setting,
-    // the monitor's rate for fps_limit = display, 60 without the real-time step. cfg_int would read "display" as the
-    // setting's default, 60, and Reflex would hold a 144 Hz monitor to 60 fps.
-    double hz = frame_step_limit_hz();
-    if (hz > 0) min_us = (uint32_t)(1e6 / hz);
+    // With TOTK_FRAME_QUEUE=1 the game's own back-edge pacer holds one completed frame in present_main so sudden
+    // workload jumps (such as exiting the quick weapon menu back to the 3D world) stay at a steady display cadence.
+    // Giving Reflex minimumIntervalUs = 1/hz drains that queue to 0 ms and sleeps up to (period - menu_time) before
+    // the heavy gameplay frame, causing 54/18/46/21 ms frametime oscillation. Keep minimumIntervalUs = 0 when
+    // frame_queue is enabled so Reflex still provides lowLatencyBoost and GPU backpressure without fighting the pacer.
+    if (!cfg_bool("TOTK_FRAME_QUEUE")) {
+        double hz = frame_step_limit_hz();
+        if (hz > 0) min_us = (uint32_t)(1e6 / hz);
+    }
     if (mode == g_reflex_mode && min_us == g_reflex_min_us) return;
-    g_reflex_mode = mode;
+    __atomic_store_n(&g_reflex_mode, mode, __ATOMIC_RELEASE);
     g_reflex_min_us = min_us;
     VkLatencySleepModeInfoNV mi = {
         .sType = VK_STRUCTURE_TYPE_LATENCY_SLEEP_MODE_INFO_NV,
@@ -413,9 +422,11 @@ void vk_reflex_present_frame(uint64_t id) {
 
 void vk_reflex_marker(int marker, uint64_t pid) {
     VkCtx *c = vk_ctx();
-    if (!c || !c->has_nv_reflex || !g_reflex_marker || g_reflex_mode <= 0 || !g_sc || !pid) return;
-    plat_rmutex_lock(&g_pl);
-    if (g_sc && g_reflex_marker) {
+    if (!c || !c->has_nv_reflex || !pid || __atomic_load_n(&g_reflex_mode, __ATOMIC_ACQUIRE) <= 0) return;
+    // VK_NV_low_latency2 explicitly allows vkSetLatencyMarkerNV concurrently with swapchain operations other than
+    // vkDestroySwapchainKHR. Shared g_sc_rw guards swapchain lifetime without contending with g_pl or vk_reflex_sleep.
+    plat_mutex_lock_shared(&g_sc_rw);
+    if (g_sc && g_reflex_marker && __atomic_load_n(&g_reflex_mode, __ATOMIC_ACQUIRE) > 0) {
         VkSetLatencyMarkerInfoNV mi = {
             .sType = VK_STRUCTURE_TYPE_SET_LATENCY_MARKER_INFO_NV,
             .presentID = pid,
@@ -423,29 +434,34 @@ void vk_reflex_marker(int marker, uint64_t pid) {
         };
         g_reflex_marker(c->device, g_sc, &mi);
     }
-    plat_rmutex_unlock(&g_pl);
+    plat_mutex_unlock_shared(&g_sc_rw);
 }
 
 void vk_reflex_sleep(void) {
     VkCtx *c = vk_ctx();
-    if (!c || !c->has_nv_reflex || !g_reflex_sleep || !g_reflex_sem || g_reflex_mode <= 0 || !g_sc) return;
+    if (!c || !c->has_nv_reflex || __atomic_load_n(&g_reflex_mode, __ATOMIC_ACQUIRE) <= 0) return;
     uint64_t val = __atomic_add_fetch(&g_reflex_val, 1, __ATOMIC_RELAXED);
-    VkLatencySleepInfoNV si = {
-        .sType = VK_STRUCTURE_TYPE_LATENCY_SLEEP_INFO_NV,
-        .signalSemaphore = g_reflex_sem,
-        .value = val
-    };
-    // vkLatencySleepNV uses the swapchain, which Vulkan wants externally synchronised with the acquire and the present
-    // (they run under g_pl on the present thread). The wait for the semaphore stays outside the lock.
+    // NVIDIA Windows drivers can sleep synchronously inside vkLatencySleepNV; holding g_pl across it stalls both
+    // present_main (vk_present_flip / vk_reflex_present_frame) and input polling (vk_reflex_marker). Shared g_sc_rw
+    // protects g_sc against vkDestroySwapchainKHR without blocking presents or markers.
     VkResult r = VK_ERROR_INITIALIZATION_FAILED;
-    plat_rmutex_lock(&g_pl);
-    if (g_sc) r = g_reflex_sleep(c->device, g_sc, &si);
-    plat_rmutex_unlock(&g_pl);
-    if (r == VK_SUCCESS) {
+    VkSemaphore sem = VK_NULL_HANDLE;
+    plat_mutex_lock_shared(&g_sc_rw);
+    if (g_sc && g_reflex_sleep && g_reflex_sem && __atomic_load_n(&g_reflex_mode, __ATOMIC_ACQUIRE) > 0) {
+        sem = g_reflex_sem;
+        VkLatencySleepInfoNV si = {
+            .sType = VK_STRUCTURE_TYPE_LATENCY_SLEEP_INFO_NV,
+            .signalSemaphore = sem,
+            .value = val
+        };
+        r = g_reflex_sleep(c->device, g_sc, &si);
+    }
+    plat_mutex_unlock_shared(&g_sc_rw);
+    if (r == VK_SUCCESS && sem) {
         VkSemaphoreWaitInfo wi = {
             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
             .semaphoreCount = 1,
-            .pSemaphores = &g_reflex_sem,
+            .pSemaphores = &sem,
             .pValues = &val
         };
         vkWaitSemaphores(c->device, &wi, 100000000ULL);
@@ -515,10 +531,12 @@ static void flip_one(void) {
     if (c && !generated) latency_note(c, pid ? pid : frame_pid);
     vk_device_fault_report(r);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) plat_xchg32(&g_dirty, 1);
+    if (!generated) __atomic_store_n(&g_last_flip_ns, (int64_t)plat_now_ns(), __ATOMIC_RELEASE);
     __atomic_add_fetch(&g_shown, 1, __ATOMIC_RELAXED);
 }
 
 uint64_t gfx_presents_shown(void) { return (uint64_t)__atomic_load_n(&g_shown, __ATOMIC_RELAXED); }
+uint64_t gfx_last_flip_ns(void) { return (uint64_t)__atomic_load_n(&g_last_flip_ns, __ATOMIC_ACQUIRE); }
 
 // Every blit left waiting goes out, in order (g_pl held): before a swapchain rebuild and before the next blit (but the
 // pair's second); the device release drops them.
@@ -565,6 +583,7 @@ static int build_swapchain(void) {
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
     if (count > 8) count = 8;
 
+    plat_mutex_lock(&g_sc_rw);
     vk_queue_lock();
     vkDeviceWaitIdle(c->device);
     VkSwapchainKHR old = g_sc;
@@ -587,6 +606,7 @@ static int build_swapchain(void) {
         rt_log("gfx: vkCreateSwapchainKHR failed (%d)", (int)r);
         g_sc = old;
         vk_queue_unlock();
+        plat_mutex_unlock(&g_sc_rw);
         return 0;
     }
     for (uint32_t i = 0; i < g_sc_n; i++) {
@@ -620,8 +640,9 @@ static int build_swapchain(void) {
     }
     // The Reflex sleep mode belongs to the swapchain: a new one (resize, fullscreen, out of date) starts with low
     // latency off, so the mode is set on it again even though the setting did not change.
-    g_reflex_mode = -1;
+    __atomic_store_n(&g_reflex_mode, -1, __ATOMIC_RELEASE);
     reflex_apply_locked();
+    plat_mutex_unlock(&g_sc_rw);
     return 1;
 }
 
@@ -1066,6 +1087,7 @@ void gfx_window_resize(int cw, int chh) {
 void gfx_window_release_vk(void) {
     VkCtx *c = vk_ctx();
     plat_rmutex_lock(&g_pl);
+    plat_mutex_lock(&g_sc_rw);
     if (c && g_started) {
         vk_queue_lock();
         vkDeviceWaitIdle(c->device);
@@ -1080,7 +1102,7 @@ void gfx_window_release_vk(void) {
             vkDestroySemaphore(c->device, g_reflex_sem, NULL);
             g_reflex_sem = VK_NULL_HANDLE;
         }
-        g_reflex_mode = -1;
+        __atomic_store_n(&g_reflex_mode, -1, __ATOMIC_RELEASE);
         free_capture();
         free_thumbs();
         for (int i = 0; i < FRAMES; i++) {
@@ -1098,6 +1120,7 @@ void gfx_window_release_vk(void) {
         g_sc = VK_NULL_HANDLE; g_surface = VK_NULL_HANDLE; g_pool = VK_NULL_HANDLE; g_sc_n = 0;
         g_started = 0;     // the window and its thread stay; the next gfx_window_start makes a new surface
     }
+    plat_mutex_unlock(&g_sc_rw);
     plat_rmutex_unlock(&g_pl);
 }
 

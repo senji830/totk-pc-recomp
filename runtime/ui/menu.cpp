@@ -55,6 +55,7 @@ int vk_exec_replay_workers(void);
 void res_sizes(unsigned out[2], unsigned scene[2]);
 double frame_step_limit_hz(void);
 uint64_t gfx_presents_shown(void);   // gfx_present.c
+uint64_t gfx_last_flip_ns(void);     // gfx_present.c
 int gfx_frame_gen_live(void);        // vk_backend.c
 extern const int rt_game_version;
 extern const char rt_port_version[];
@@ -1682,8 +1683,13 @@ static void perf_tick(uint64_t now, const MenuTarget *t) {
     }
     if (g_perf_mode) shown_tick(now);
     if (g_perf_mode != 1) return;
-    uint64_t d = now - g_perf_last_ns;
-    if (!g_perf_last_ns || d > 2000000000ull) {   // first frame, or a stall the window should not average in
+    // Measure actual display flips rather than pre-pacing blit submissions: with frame_queue=1, blits run up to one
+    // period ahead of wait_until(j.at), so blit timestamps oscillate across light/heavy transitions while flips stay flat.
+    uint64_t flip = gfx_last_flip_ns();
+    if (flip && flip == g_perf_last_ns) return;
+    uint64_t sample = flip ? flip : now;
+    uint64_t d = sample > g_perf_last_ns ? sample - g_perf_last_ns : 0;
+    if (!g_perf_last_ns || !d || d > 2000000000ull) {   // first frame, or a stall the window should not average in
         g_perf_win_ns = g_perf_max_ns = 0;
         g_perf_frames = 0;
     } else {
@@ -1698,7 +1704,7 @@ static void perf_tick(uint64_t now, const MenuTarget *t) {
             g_perf_frames = 0;
         }
     }
-    g_perf_last_ns = now;
+    g_perf_last_ns = sample;
 }
 
 // The panel keeps its width while the numbers change: every column is as wide as the widest text it can show, measured
