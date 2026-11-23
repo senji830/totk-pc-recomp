@@ -300,7 +300,9 @@ static VkDeviceSize image_size(const VkImageCreateInfo *ci) {
 // UNDEFINED -> GENERAL; new depth / stencil images start cleared (LAS textures.c: the game copies depth
 // without stencil, and the stencil of those images must not be whatever the memory held).
 static void init_image(Tex *e, VkCommandBuffer cb) {
-    VkImageMemoryBarrier2 ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
+    VkImageMemoryBarrier2 ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                                .srcStageMask = e->bound_to ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_2_NONE,
+                                .srcAccessMask = e->bound_to ? VK_ACCESS_2_MEMORY_WRITE_BIT : 0,
                                 .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                                 .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
                                 .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
@@ -324,15 +326,15 @@ static void init_image(Tex *e, VkCommandBuffer cb) {
     }
 }
 
-// The first transition of a new image, in the upload batch, which runs ahead of the submission being recorded. A chunk
-// of a chunked replay records it into its own command buffer at its op instead when the image is bound into pool
-// memory: the chunks before it may be on the GPU already, and a clear of the new image (its depth) there would land on
-// what they rendered into the same storage for the chunks after them to read. The inventory and the quick weapon menu
-// render the items' icons into new targets at the storage the frame's other targets share, and a black strip showed
-// right of the quick menu for a frame where its new depth targets were cleared.
+// The first transition of a new image, in the upload batch, which runs ahead of the submission being recorded. When the
+// image is bound into pool memory, record it inline into the current replay command buffer at its op instead: both a
+// chunked replay (replay_workers > 0) and a split single-threaded replay (split_draws > 0) submit earlier passes ahead
+// of this op and flush the upload batch before this part, so an upload-batch layout transition or depth clear on pool
+// memory clobbers live render targets at the same pool offset (e.g. the 1920x1080 D16 ability depth target at the
+// 960x540 r11g11b10f lighting target's storage, or the quick weapon menu's depth targets).
 static void init_new(Tex *e) {
     int reopen = 0;
-    VkCommandBuffer cb = e->bound_to && vk_exec_replay_pos() != UINT32_MAX ? vk_exec_inline_begin(&reopen) : VK_NULL_HANDLE;
+    VkCommandBuffer cb = e->bound_to ? vk_exec_inline_begin(&reopen) : VK_NULL_HANDLE;
     if (cb) {
         init_image(e, cb);
         vk_exec_inline_end(reopen);

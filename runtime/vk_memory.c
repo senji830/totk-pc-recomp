@@ -351,6 +351,9 @@ void vk_pool_fini(pool_t *p) {
 // Requests were checked by the front end (nvn_api_core.c, MNG totk_vpool.c); apply them in order.
 int vk_pool_map_virtual(pool_t *v, int n, const void *requests) {
     const nvn_mapping_t *rq = requests;
+    typedef struct { uint64_t lo, size; } GoneRange;
+    GoneRange gone_stack[32], *gone = gone_stack;
+    int gone_cap = 32, gone_n = 0;
     plat_mutex_lock(&pool_lock);
     const pidx_ent *e = pidx_find(&pool_index, (uintptr_t)v->mem, 0);
     PoolRec *r = e && e->key == v ? e->buf : NULL;
@@ -366,10 +369,30 @@ int vk_pool_map_virtual(pool_t *v, int n, const void *requests) {
         }
         uint64_t first = (uint64_t)rq[i].virtual_offset / NVN_VPOOL_PAGE, count = rq[i].size / NVN_VPOOL_PAGE;
         if (first + count > r->npages) { ok = 0; break; }
-        for (uint64_t k = 0; k < count; k++)
-            r->pt[first + k] = (VPage){ph, ph ? (uint64_t)rq[i].physical_offset + k * NVN_VPOOL_PAGE : 0};
+        int changed = 0;
+        for (uint64_t k = 0; k < count; k++) {
+            uint64_t noff = ph ? (uint64_t)rq[i].physical_offset + k * NVN_VPOOL_PAGE : 0;
+            VPage old = r->pt[first + k];
+            if (old.phys && (old.phys != ph || old.off != noff)) changed = 1;
+            r->pt[first + k] = (VPage){ph, noff};
+        }
+        if (changed && rq[i].size) {
+            if (gone_n == gone_cap) {
+                int nc = gone_cap * 2;
+                GoneRange *ng = malloc(sizeof *ng * (size_t)nc);
+                if (ng) {
+                    memcpy(ng, gone, sizeof *ng * (size_t)gone_n);
+                    if (gone != gone_stack) free(gone);
+                    gone = ng;
+                    gone_cap = nc;
+                }
+            }
+            if (gone_n < gone_cap) gone[gone_n++] = (GoneRange){r->lo + (uint64_t)rq[i].virtual_offset, rq[i].size};
+        }
     }
     plat_mutex_unlock(&pool_lock);
+    for (int i = 0; i < gone_n; i++) vk_texture_range_gone(gone[i].lo, gone[i].size, NULL);
+    if (gone != gone_stack) free(gone);
     if (!ok) rt_log("vk: MapVirtual on pool %p failed", (void *)v->mem);
     return ok;
 }
