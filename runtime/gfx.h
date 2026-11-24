@@ -70,6 +70,9 @@ const GfxShader *gfx_shader_load_input(const uint8_t iid[32], int xlate);
 // Boot prewarm: out[i] = gfx_shader_load_input(iids[i], 1) on `threads` threads with up to `procs` translators, then
 // every other stored input not cached under this translator is translated. Logs progress and the total.
 void gfx_shader_prewarm(const uint8_t (*iids)[32], size_t n, const GfxShader **out, int threads, int procs);
+// Starts the background translation workers and pre-spawns one idle translator child on a low-priority thread so the
+// first uncached runtime shader (e.g. a one-shot icon render) does not stall on cold-starting totk_xlate.exe.
+void gfx_shader_warm_svc(void);
 // Answers met in play: from this call on, every (program, answers) a gfx_shader_get* call resolves is appended
 // to shader-answers.bin, and its program to shader-programs.bin, in the directory of `keys_path` (pipeline-keys.bin).
 void gfx_shader_record_at(const char *keys_path);

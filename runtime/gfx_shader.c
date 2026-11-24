@@ -1350,8 +1350,31 @@ static int in_load(const uint8_t iid[32], Inputs *in) {
 
 // ---- translation
 
+typedef struct {
+    int active, rename;
+    char spv_path[PATH_CAP + 80], res_path[PATH_CAP + 80], hex[65];
+    uint8_t code_hash[32], mk[32], miid[32];
+    UseMask m;
+} XPersist;
+
+static void translate_persist(const XPersist *p, int stage, const uint8_t *control, const uint8_t *code, const Req *r,
+                              const GfxShaderAnswers *a) {
+    plat_file_flush(p->spv_path), plat_file_flush(p->res_path);   // the translator wrote them; on disk before use or rename
+    if (p->rename) {
+        char mhex[65], to[PATH_CAP + 80];
+        key_hex(p->mk, mhex);
+        snprintf(to, PATH_CAP + 80, "%s/%s.spv", cache_dir, mhex);
+        int moved = plat_file_replace(p->spv_path, to);
+        snprintf(to, PATH_CAP + 80, "%s/%s.res.json", cache_dir, mhex);
+        moved = moved && plat_file_replace(p->res_path, to);
+        if (moved) use_store(p->code_hash, &p->m);
+        else plat_file_delete(p->spv_path), plat_file_delete(p->res_path), rt_log("gfx_shader: cannot rename %s", p->hex);
+    }
+    in_store(p->miid, stage, control, code, r, a);
+}
+
 static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *control, const uint8_t *code,
-                                      const GfxShaderAnswers *a) {
+                                      const GfxShaderAnswers *a, XPersist *defer) {
     const uint8_t *key = r->key;
     GfxShader *s;
     UseMask m;
@@ -1392,8 +1415,29 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
         plat_file_delete(spv_path), plat_file_delete(res_path);
         return fail(reply, hex);
     }
-    plat_file_flush(spv_path), plat_file_flush(res_path);   // the translator wrote them; on disk before use or rename
+    if (!defer) plat_file_flush(spv_path), plat_file_flush(res_path);   // the translator wrote them; on disk before use or rename
     if (!(s = disk_load(key, r->iid))) return fail("translator output missing or malformed", hex);
+    if (defer) {
+        defer->active = 1, defer->rename = !r->final;
+        memcpy(defer->spv_path, spv_path, sizeof defer->spv_path);
+        memcpy(defer->res_path, res_path, sizeof defer->res_path);
+        memcpy(defer->hex, hex, sizeof defer->hex);
+        memcpy(defer->code_hash, r->code_hash, 32);
+        if (!r->final) {
+            m = use_of(s);
+            build_key(r->code_hash, a, &m, mk, miid);
+            defer->m = m;
+            memcpy(defer->mk, mk, 32), memcpy(defer->miid, miid, 32);
+            plat_mutex_lock(&cache_lock);
+            use_put(r->code_hash, 1, &m);
+            plat_mutex_unlock(&cache_lock);
+            memcpy(s->key, mk, 32), memcpy(s->iid, miid, 32);
+        } else {
+            memcpy(defer->miid, s->iid, 32);
+        }
+        plat_inc64(&n_xlated);
+        return mem_insert(s);
+    }
     if (!r->final) {                                       // name the files after the cache key, remember the mask
         m = use_of(s);
         build_key(r->code_hash, a, &m, mk, miid);
@@ -1420,15 +1464,20 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
 
 // The service round trip for a request that is in neither cache. One translation per cache key (per code hash while
 // the use mask is unknown) runs at a time; different shaders run in parallel on the children.
-static const GfxShader *translate(const Req *r, int stage, const uint8_t *control, const uint8_t *code,
-                                  const GfxShaderAnswers *a) {
+static const GfxShader *translate_ex(const Req *r, int stage, const uint8_t *control, const uint8_t *code,
+                                     const GfxShaderAnswers *a, XPersist *defer) {
     int away = kern_core_away();
     const uint8_t *id = r->final ? r->key : r->code_hash;
     flight_enter(id);
-    const GfxShader *s = translate_one(r, stage, control, code, a);
+    const GfxShader *s = translate_one(r, stage, control, code, a, defer);
     flight_leave(id);
     kern_core_back(&away);
     return s;
+}
+
+static const GfxShader *translate(const Req *r, int stage, const uint8_t *control, const uint8_t *code,
+                                  const GfxShaderAnswers *a) {
+    return translate_ex(r, stage, control, code, a, NULL);
 }
 
 // ---- background translation (gfx_shader_get_async)
@@ -1474,7 +1523,8 @@ static void xlate_worker(void *arg) {
         XJob *j = X.head;
         if (!(X.head = j->next)) X.tail = NULL;
         plat_mutex_unlock(&X.lock);
-        const GfxShader *s = translate(&j->r, j->stage, j->control, j->code, &j->a);
+        XPersist persist = {0};
+        const GfxShader *s = translate_ex(&j->r, j->stage, j->control, j->code, &j->a, &persist);
         plat_mutex_lock(&X.lock);
         XWait **w = wait_slot(j->r.key), *e = *w;
         if (e && s) *w = e->next, free(e);
@@ -1482,10 +1532,50 @@ static void xlate_worker(void *arg) {
         plat_mutex_unlock(&X.lock);
         plat_cond_broadcast(&X.done);
         if (s) plat_inc64(&n_async);
+        if (persist.active) translate_persist(&persist, j->stage, j->control, j->code, &j->r, &j->a);
         free(j->control), free(j->code), free(j);
     }
     return;
 }
+
+// Caller holds X.lock exclusively.
+static void xlate_workers_start_locked(void) {
+    if (X.started) return;
+    int n = 0;
+    for (int i = 0; i < svc_runtime_limit(); i++) {
+        if (plat_thread_spawn(xlate_worker, NULL, "xlate", 0)) n++;
+    }
+    X.started = n ? 1 : -1;
+    if (n) rt_log("gfx_shader: graphics shaders are translated by %d background workers (TOTK_XLATE_PROCS)", n);
+    else rt_log("gfx_shader: cannot start the translation workers; translating synchronously");
+}
+
+static void svc_warm_worker(void *arg) {
+    (void)arg;
+    plat_thread_priority(PLAT_PRIO_BELOW_NORMAL);
+    paths();
+    if (!xlate_exe[0] || !file_exists(xlate_exe)) return;
+    plat_mutex_lock(&X.lock);
+    xlate_workers_start_locked();
+    plat_mutex_unlock(&X.lock);
+    Svc *v = svc_get();
+    if (!v->child) {
+        uint64_t t0 = plat_now_ms();
+        if (child_start(v)) {
+            char reply[LINE_MAX_LEN];
+            if (!child_exchange_raw(v, "{}", reply, sizeof reply)) child_stop(v);
+            else rt_log("gfx_shader: translator child ready in %llu ms", (unsigned long long)(plat_now_ms() - t0));
+        }
+    }
+    svc_put(v);
+}
+
+void gfx_shader_warm_svc(void) {
+    static volatile int32_t started;
+    if (plat_xchg32(&started, 1)) return;
+    plat_thread_spawn(svc_warm_worker, NULL, "xlate warm", 0);
+}
+
 const GfxShader *gfx_shader_get_async(int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size,
                                       const GfxShaderAnswers *a, int *pending) {
     *pending = 0;
@@ -1513,15 +1603,7 @@ static const GfxShader *get_async_one(Req r, int stage, const uint8_t *control, 
     XWait *e = calloc(1, sizeof *e);
     uint8_t *ctl = malloc(CONTROL_SIZE), *cd = malloc(r.length);
     plat_mutex_lock(&X.lock);
-    if (!X.started) {
-        int n = 0;
-        for (int i = 0; i < svc_runtime_limit(); i++) {
-            if (plat_thread_spawn(xlate_worker, NULL, "xlate", 0)) n++;
-        }
-        X.started = n ? 1 : -1;
-        if (n) rt_log("gfx_shader: graphics shaders are translated by %d background workers (TOTK_XLATE_PROCS)", n);
-        else rt_log("gfx_shader: cannot start the translation workers; translating synchronously");
-    }
+    xlate_workers_start_locked();
     XWait **slot = wait_slot(r.key);
     int raced = *slot != NULL;                             // another thread queued it between the checks
     int queued = !raced && X.started == 1 && j && e && ctl && cd;

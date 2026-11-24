@@ -395,6 +395,7 @@ void rt_boot(void) {
     if (warm) plat_thread_join(warm);
     else vk_pipeline_prewarm();
     held = plat_now_ms() - held;
+    if (vk_pipeline_async_on()) gfx_shader_warm_svc();
     rt_log("boot: guest starts %llu ms after process start (%llu ms of it waiting for the prewarm)",
            (unsigned long long)(plat_process_uptime_ns() / 1000000), (unsigned long long)held);
     rt_guest_start_ns = kern_now_ns();
