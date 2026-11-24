@@ -687,6 +687,9 @@ VkPipeline vk_pipeline_graphics(const VkPipeState *s, const VkPipeInfo **info);
 // wait_ms > 0 waits up to that long for a pending pipeline first. Pipelines built in a run are recorded to
 // pipeline-keys.bin next to the pipeline cache and prebuilt at the next boot (TOTK_PIPE_PREBUILD=0: not).
 VkPipeline vk_pipeline_graphics_async(const VkPipeState *s, const VkPipeInfo **info, int *pending, uint32_t wait_ms);
+// As vk_pipeline_graphics_async, but only waits for GPL stage-library fast linking; pipelines GPL cannot link (e.g.
+// feedback loops) are promoted for background workers without blocking the render thread on a monolithic compile.
+VkPipeline vk_pipeline_graphics_gpl_async(const VkPipeState *s, const VkPipeInfo **info, int *pending, uint32_t wait_ms);
 // rt_boot calls it unless --shot is given; TOTK_PIPE_SYNC=1 makes it a no-op. Probes never call it.
 void vk_pipeline_async_enable(void);
 int vk_pipeline_async_on(void);   // 1 after vk_pipeline_async_enable: graphics shaders are translated in the background too

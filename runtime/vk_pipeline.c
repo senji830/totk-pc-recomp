@@ -2374,7 +2374,8 @@ static void lib_wait(const VkPipeState *s, const GKey *k, Layout *l, double end)
     }
 }
 
-static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int async, int *pending, uint32_t wait_ms) {
+static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int async, int *pending, uint32_t wait_ms,
+                           int mono_wait) {
     if (info) *info = NULL;
     if (pending) *pending = 0;
     if (!s->vs || !ensure_init()) return VK_NULL_HANDLE;
@@ -2403,8 +2404,8 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
                : U.on ? "has its libraries built in parallel on the workers, ahead of other jobs"
                       : "builds its libraries itself (TOTK_PIPE_WAIT=draw)");
     }
-    double end = wait_ms ? now_ms() + wait_ms : 0;
-    if (p && p->building && P.gpl && !p->info.pipeline && !p->fast_tried && p->lay) {
+    double end = (p && p->building && wait_ms) ? now_ms() + wait_ms : 0;
+    if (p && p->building && P.gpl && !p->info.pipeline && !p->fast_tried && p->lay && p->lay->set1 && !k.fbl) {
         int final = 0, build = wait_ms != 0 && draw_build;
         uint64_t p0 = perf_begin(), t0 = qpc();
         if (build && U.on) {
@@ -2434,12 +2435,13 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
     }
     if (p && p->building && !p->info.pipeline) {
         promote(p);
-        uint64_t p0 = wait_ms ? perf_begin() : 0;   // the wait counts as the render thread's pipeline time
+        uint32_t mwait = mono_wait ? wait_ms : 0;
+        uint64_t p0 = mwait ? perf_begin() : 0;   // the wait counts as the render thread's pipeline time
         double now;
-        while (p->building && !p->info.pipeline && wait_ms && (now = now_ms()) < end)
+        while (p->building && !p->info.pipeline && mwait && (now = now_ms()) < end)
             plat_cond_wait_ms(&done_cv, &P.lock, (uint32_t)(end - now) + 1);
-        if (wait_ms) perf_end(PERF_PIPE, p0);
-        if (wait_ms && !p->building) perf_count(PERF_CNT_PIPE_WAIT);
+        if (mwait) perf_end(PERF_PIPE, p0);
+        if (mwait && !p->building) perf_count(PERF_CNT_PIPE_WAIT);
     }
     int wait = p && p->building && !p->info.pipeline;
     if (wait) P.stats.pending_skips++;
@@ -2456,11 +2458,15 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
 }
 
 VkPipeline vk_pipeline_graphics(const VkPipeState *s, const VkPipeInfo **info) {
-    return graphics(s, info, 0, NULL, 0);
+    return graphics(s, info, 0, NULL, 0, 1);
 }
 
 VkPipeline vk_pipeline_graphics_async(const VkPipeState *s, const VkPipeInfo **info, int *pending, uint32_t wait_ms) {
-    return graphics(s, info, A.on, pending, wait_ms);
+    return graphics(s, info, A.on, pending, wait_ms, 1);
+}
+
+VkPipeline vk_pipeline_graphics_gpl_async(const VkPipeState *s, const VkPipeInfo **info, int *pending, uint32_t wait_ms) {
+    return graphics(s, info, A.on, pending, wait_ms, 0);
 }
 
 // ---- boot prewarm from the key file (comment at "pipeline keys")
@@ -3009,7 +3015,7 @@ static void lb_worker(void *arg) {
             plat_mutex_unlock(&LB.stat);
             continue;
         }
-        int keep = i < LB.n_cs || (int32_t)(i - LB.n_cs) < LB.keep_n, owned = 0;
+        int keep = i < LB.n_cs || (LB.e[i].prio == 0 && (int32_t)(i - LB.n_cs) < LB.keep_n), owned = 0;
         plat_thread_priority(PLAT_PRIO_NORMAL);   // gfx_shader's cache lock, disk reads
         const GfxShader *sh = keep ? gfx_shader_load_input(LB.e[i].iid, 0) : gfx_shader_load_private(LB.e[i].iid, &owned);
         plat_thread_priority(PLAT_PRIO_IDLE);
@@ -3043,8 +3049,8 @@ static void lb_state(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     LB.samples = (uint8_t)(1u << bf);
 }
 
-// Boot: compute shaders of the warm list (recorded and prepared), then all recorded graphics variants (the first KEEP
-// kept in libs[], the rest warmed into the driver cache with their vertex output unions).
+// Boot: compute shaders of the warm list (recorded and prepared), then all graphics variants in priority order
+// (recorded first, then prepared; the first KEEP recorded kept in libs[], the rest warmed into the driver cache).
 static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     const char *e = cfg_value("TOTK_LIB_PREBUILD"), *ke = cfg_get("TOTK_LIB_PREBUILD_KEEP");
     const char *te = cfg_get("TOTK_LIB_PREBUILD_THREADS");   // no fixed default: a quarter of the CPUs when unset
@@ -3059,7 +3065,7 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
         if (all[i].stage == GFX_STAGE_CS) LB.e[n++] = all[i];
     n_cs = n;
     for (size_t i = 0; LB.e && i < total; i++)
-        if (all[i].stage != GFX_STAGE_CS && all[i].prio == 0) LB.e[n++] = all[i];
+        if (all[i].stage != GFX_STAGE_CS) LB.e[n++] = all[i];
     free(all);
     if (atoi(e) > 1 && (size_t)atoi(e) < n) n = (size_t)atoi(e);   // a count above 1 caps the list; 1 is plain on
     if (!n) {

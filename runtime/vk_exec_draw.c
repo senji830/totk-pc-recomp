@@ -3696,7 +3696,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     if (vs_wait || fs_wait) {
         if (!(oneshot = !vk_exec_targets_recent(ex, skip >= 1))) {
             uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-            if (f != D->wait_frame) D->wait_frame = f, D->wait_left_ns = skip == 0 ? 200000000 : 50000000;
+            if (f != D->wait_frame) D->wait_frame = f, D->wait_left_ns = skip == 0 ? 80000000 : 25000000;
             if (skip > 0 || !D->wait_left_ns) return perf_count(PERF_CNT_SHADER_SKIP), 0;   // skipped until ready
             uint64_t t_sh = kern_now_ns();
             if (vs_wait) vs = shader_for(ex, NVN_STAGE_VS, &has_vs, NULL, 1);
@@ -3746,18 +3746,20 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     const VkPipeInfo *info = NULL;
     int pending;
     // A draw of at most 6 vertices over half the render area or more (a full-screen triangle or quad, a tile) or, in
-    // strict/GPL mode, any scene/cutscene draw whose pipeline is building waits from the frame budget (200 ms in strict,
-    // 50 ms in any; TOTK_PIPE_SKIP=fullscreen skips them instead): skipping geometry or lighting draws in a cutscene
-    // leaves objects or the screen black for several frames while workers build. A one-shot draw waits without budget.
+    // strict/any+GPL mode, any scene/cutscene draw whose pipeline is building waits from the frame budget (80 ms in
+    // strict, 25 ms in any; TOTK_PIPE_SKIP=fullscreen skips them instead). Under any (default), 3D geometry draws only
+    // wait for GPL fast-linking so non-GPL monolithic pipelines never stall the frame. A one-shot draw waits without budget.
     int full = count <= 6 && (uint64_t)sc.extent.width * sc.extent.height * 2 >= (uint64_t)ex->pass_w * ex->pass_h;
+    int gpl_only = 0;
     uint32_t wait_ms = 0;
     uint64_t t0 = 0;
     if (oneshot > 0) {
         wait_ms = ONESHOT_WAIT_MS;
     } else if (skip == 0 || (skip < 2 && (full || vk_caps.gpl))) {
         uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-        if (f != D->wait_frame) D->wait_frame = f, D->wait_left_ns = skip == 0 ? 200000000 : 50000000;
+        if (f != D->wait_frame) D->wait_frame = f, D->wait_left_ns = skip == 0 ? 80000000 : 25000000;
         wait_ms = (uint32_t)(D->wait_left_ns / 1000000);
+        gpl_only = skip > 0 && !full;
     }
     // The previous draw's pipeline while its state repeats (PM, TOTK_PIPE_MEMO=0 turns it off): the cache key is made
     // from the state alone, and a pipeline once found only changes from its fast link to its optimised build, read
@@ -3780,7 +3782,8 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     } else {
         if (wait_ms && oneshot <= 0) t0 = kern_now_ns();
         w0 = t0 ? t0 : wait_ms ? kern_now_ns() : 0;   // the clock is read only for draws that may wait
-        p = vk_pipeline_graphics_async(&s, &info, &pending, wait_ms);
+        p = gpl_only ? vk_pipeline_graphics_gpl_async(&s, &info, &pending, wait_ms)
+                     : vk_pipeline_graphics_async(&s, &info, &pending, wait_ms);
         if (t0) {
             uint64_t spent = kern_now_ns() - t0;
             if (spent >= 50000) D->wait_left_ns = spent < D->wait_left_ns ? D->wait_left_ns - spent : 0;
