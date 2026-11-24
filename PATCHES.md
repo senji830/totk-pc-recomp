@@ -1,4 +1,4 @@
-# Upstream Attribution & Patch Notes (`0.5.0+afae80c9-patch5`)
+# Upstream Attribution & Patch Notes (`0.5.0+afae80c9-patch6`)
 
 ## Original Source & Licensing
 
@@ -55,15 +55,16 @@ All original TotK Recomp code, architecture, lifter, runtime, installer, and doc
 - **Fix:**
   - Scope `cache_use` locking to Intel GPUs (`vendorID == 0x8086`), allow concurrent `vkGetPipelineCacheData()` with headroom + up to 3 `VK_INCOMPLETE` retries on non-Intel GPUs, and raise the background autosave interval from `20 s` to `60 s`.
 
-### 5. Cutscene & New-Scene Black Objects / Screen During Pipeline Builds
-- **Files:** `runtime/vk_exec_draw.c`, `runtime/vk_pipeline.c`, `runtime/cfg.c`, `totk.ini.example`
+### 5. Cutscene & New-Scene Black Objects / Screen During Pipeline Builds (refined in `patch6`)
+- **Files:** `runtime/vk.h`, `runtime/vk_exec_draw.c`, `runtime/vk_pipeline.c`, `runtime/cfg.c`, `totk.ini.example`
 - **Root Cause:**
   - `TOTK_PIPE_SKIP` defaulted to `fullscreen` (`2`), which skipped full-screen lighting/composite passes and all 3D geometry draws (`count > 6`) into recent render targets while background workers compiled missing shader/GPL pipeline state. At the start of in-engine cutscenes (where the scene reuses recent color/depth buffers while introducing new actor shaders/materials), skipping those draws rendered characters, objects, or the entire frame black for several frames until background builds completed.
-  - Boot-time stage library prebuilding (`lb_start()`) also skipped warming recorded priority-0 graphics shader variants into the driver disk cache whenever `TOTK_LIB_PREBUILD_KEEP=0`.
+  - Under `strict` (`0`, tested in `patch5`), passes where the color target was rendered every frame while the depth target rotated triggered false `one-shot` `30,000 ms` waits (`241 ms` spike), and pipelines incompatible with GPL (`!p->lay->set1 || k.fbl`, e.g. feedback loops) wasted time in `lib_wait()` before blocking the render thread on monolithic `create_graphics()` (`40+ ms`).
+  - Boot-time stage library prebuilding (`lb_start()`) also skipped warming graphics variants into the driver disk cache whenever `TOTK_LIB_PREBUILD_KEEP=0`.
 - **Fix:**
-  - Change default `PIPE_SKIP` from `fullscreen` to `strict` (`0`).
-  - In `strict` mode (and for `any` when `vk_caps.gpl` is enabled), allow pending scene/cutscene draws (shaders and 3D geometry in `strict`, as well as full-screen passes) to share a bounded per-frame wait budget (`200 ms` in `strict`, `50 ms` in `any`) so GPL `lib_wait()` + fast-linking completes in the same frame instead of dropping draws to black; cache hits do not consume wait budget.
-  - Warm all recorded priority-0 vertex/fragment variants into the driver disk cache (`keep = 0`, releasing temporary shader/pipeline objects unless `TOTK_LIB_PREBUILD_KEEP > 0`) on idle-priority background threads after boot prewarm.
+  - Set default `PIPE_SKIP` to `any` (`1`) with a tight `25 ms` per-frame wait budget (`80 ms` in `strict`), preventing false `one-shot` stalls on depth-buffer swaps while still protecting genuine one-shot passes (`color_first == 1` or no recent target).
+  - Add `vk_pipeline_graphics_gpl_async()` (`mono_wait = 0`) for 3D geometry draws in `any` mode and guard `lib_wait()`/`gpl_link()` with `p->lay->set1 && !k.fbl`, so GPL-linkable cutscene draws fast-link in the same frame (`0.02–3 ms`) without blocking on slow monolithic compiles for non-GPL feedback draws; cache hits consume zero wait budget.
+  - Warm all graphics stage library variants from the warm list (`shader-answers.bin` recorded variants first, followed by `shader-prepared.bin`) into the driver disk cache (`keep = 0`, releasing temporary shader/pipeline objects unless `TOTK_LIB_PREBUILD_KEEP > 0` for `prio == 0`) on idle-priority background threads after boot prewarm.
 
 ---
 
