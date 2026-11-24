@@ -3059,7 +3059,8 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     if (cache_dir(dir, sizeof dir)) skip_init(dir);
     GfxWarmEnt *all = NULL;
     size_t total = gfx_shader_warm_list(&all), n = 0, n_cs = 0;
-    LB.keep_n = ke && *ke ? atoi(ke) : 0;
+    LB.keep_n = ke && *ke ? atoi(ke) : 1024;
+    if (LB.keep_n < 0) LB.keep_n = 0;
     LB.e = malloc((total + 1) * sizeof *LB.e);
     for (size_t i = 0; LB.e && i < total; i++)
         if (all[i].stage == GFX_STAGE_CS) LB.e[n++] = all[i];
