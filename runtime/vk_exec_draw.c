@@ -3694,10 +3694,20 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     // session. A draw into per-frame targets is skipped until they are ready and comes back next frame.
     int oneshot = -1, skip = pipe_skip_mode();   // -1: not looked up
     if (vs_wait || fs_wait) {
-        if (!(oneshot = !vk_exec_targets_recent(ex, skip >= 1))) return perf_count(PERF_CNT_SHADER_SKIP), 0;   // skipped until ready
-        perf_count(PERF_CNT_ONESHOT_WAIT);
-        if (vs_wait) vs = shader_for(ex, NVN_STAGE_VS, &has_vs, NULL, 1);
-        if (fs_wait) fs = shader_for(ex, NVN_STAGE_FS, &has_fs, NULL, 1);
+        if (!(oneshot = !vk_exec_targets_recent(ex, skip >= 1))) {
+            uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+            if (f != D->wait_frame) D->wait_frame = f, D->wait_left_ns = skip == 0 ? 200000000 : 50000000;
+            if (skip > 0 || !D->wait_left_ns) return perf_count(PERF_CNT_SHADER_SKIP), 0;   // skipped until ready
+            uint64_t t_sh = kern_now_ns();
+            if (vs_wait) vs = shader_for(ex, NVN_STAGE_VS, &has_vs, NULL, 1);
+            if (fs_wait) fs = shader_for(ex, NVN_STAGE_FS, &has_fs, NULL, 1);
+            uint64_t spent = kern_now_ns() - t_sh;
+            if (spent >= 50000) D->wait_left_ns = spent < D->wait_left_ns ? D->wait_left_ns - spent : 0;
+        } else {
+            perf_count(PERF_CNT_ONESHOT_WAIT);
+            if (vs_wait) vs = shader_for(ex, NVN_STAGE_VS, &has_vs, NULL, 1);
+            if (fs_wait) fs = shader_for(ex, NVN_STAGE_FS, &has_fs, NULL, 1);
+        }
     }
     if (!vs || (has_fs && !fs)) return 0;
     if (vk_dlaa_skip_draw(ex, fs)) return 0;   // the game's FXAA off, or its scaling replaced by DLSS (vk_dlaa.c)
@@ -3735,19 +3745,19 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     }
     const VkPipeInfo *info = NULL;
     int pending;
-    // A draw of at most 6 vertices over half the render area or more (a full-screen triangle or quad, a tile) waits for
-    // its pipeline: skipping it can leave a black tile. The waits share 50 ms per presented frame
-    // (TOTK_PIPE_SKIP=fullscreen skips them instead). A one-shot draw waits without that budget. Everything else is
-    // skipped while its pipeline is built.
+    // A draw of at most 6 vertices over half the render area or more (a full-screen triangle or quad, a tile) or, in
+    // strict/GPL mode, any scene/cutscene draw whose pipeline is building waits from the frame budget (200 ms in strict,
+    // 50 ms in any; TOTK_PIPE_SKIP=fullscreen skips them instead): skipping geometry or lighting draws in a cutscene
+    // leaves objects or the screen black for several frames while workers build. A one-shot draw waits without budget.
+    int full = count <= 6 && (uint64_t)sc.extent.width * sc.extent.height * 2 >= (uint64_t)ex->pass_w * ex->pass_h;
     uint32_t wait_ms = 0;
     uint64_t t0 = 0;
     if (oneshot > 0) {
         wait_ms = ONESHOT_WAIT_MS;
-    } else if (skip < 2 && count <= 6 && (uint64_t)sc.extent.width * sc.extent.height * 2 >= (uint64_t)ex->pass_w * ex->pass_h) {
+    } else if (skip == 0 || (skip < 2 && (full || vk_caps.gpl))) {
         uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
-        if (f != D->wait_frame) D->wait_frame = f, D->wait_left_ns = 50000000;
+        if (f != D->wait_frame) D->wait_frame = f, D->wait_left_ns = skip == 0 ? 200000000 : 50000000;
         wait_ms = (uint32_t)(D->wait_left_ns / 1000000);
-        if (wait_ms) t0 = kern_now_ns();
     }
     // The previous draw's pipeline while its state repeats (PM, TOTK_PIPE_MEMO=0 turns it off): the cache key is made
     // from the state alone, and a pipeline once found only changes from its fast link to its optimised build, read
@@ -3768,13 +3778,14 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         if (pc) D->PM.valid = 1, MX_CPY(&D->PM.s, &s, sizeof s), D->PM.info = info, D->B.st_pm = 0;
         D->PM.gen = pgen;   // s equals PM.s: built from pipe as it is now
     } else {
+        if (wait_ms && oneshot <= 0) t0 = kern_now_ns();
         w0 = t0 ? t0 : wait_ms ? kern_now_ns() : 0;   // the clock is read only for draws that may wait
         p = vk_pipeline_graphics_async(&s, &info, &pending, wait_ms);
         if (t0) {
             uint64_t spent = kern_now_ns() - t0;
-            D->wait_left_ns = spent < D->wait_left_ns ? D->wait_left_ns - spent : 0;
+            if (spent >= 50000) D->wait_left_ns = spent < D->wait_left_ns ? D->wait_left_ns - spent : 0;
         }
-        why = oneshot > 0 ? "one-shot, shader" : wait_ms ? "full-screen" : NULL;
+        why = oneshot > 0 ? "one-shot, shader" : wait_ms ? (full ? "full-screen" : "draw") : NULL;
         if (pending && oneshot < 0 && !vk_exec_targets_recent(ex, skip >= 1)) {
             perf_count(PERF_CNT_ONESHOT_WAIT);
             why = "one-shot";

@@ -2665,7 +2665,7 @@ static Layout *compute_layout(const GfxShader *cs, Bindings *B, const char **why
 
 static struct {
     GfxWarmEnt *e;
-    size_t n;
+    size_t n, n_cs;
     volatile int64_t next;
     volatile int32_t stop, running;
     int threads;
@@ -2995,7 +2995,7 @@ static void lb_report(const char *how) {
     plat_mutex_unlock_shared(&LB.stat);
 }
 
-// Boot: compute pipelines and kept libraries, all entered for the process.
+// Boot: compute pipelines, kept libraries, and driver-cache prebuild of recorded graphics variants.
 static void lb_worker(void *arg) {
     (void)arg;
     plat_thread_priority(PLAT_PRIO_IDLE);
@@ -3009,8 +3009,9 @@ static void lb_worker(void *arg) {
             plat_mutex_unlock(&LB.stat);
             continue;
         }
+        int keep = i < LB.n_cs || (int32_t)(i - LB.n_cs) < LB.keep_n, owned = 0;
         plat_thread_priority(PLAT_PRIO_NORMAL);   // gfx_shader's cache lock, disk reads
-        const GfxShader *sh = gfx_shader_load_input(LB.e[i].iid, 0);
+        const GfxShader *sh = keep ? gfx_shader_load_input(LB.e[i].iid, 0) : gfx_shader_load_private(LB.e[i].iid, &owned);
         plat_thread_priority(PLAT_PRIO_IDLE);
         if (!sh) {
             plat_mutex_lock(&LB.stat);
@@ -3019,9 +3020,10 @@ static void lb_worker(void *arg) {
         } else if (gfx_shader_stage(sh) == GFX_STAGE_CS) {
             lb_compute(sh);
         } else if (gfx_shader_stage(sh) == GFX_STAGE_VS || gfx_shader_stage(sh) == GFX_STAGE_FS) {
-            if (P.gpl) lb_library(sh, gfx_shader_stage(sh) == GFX_STAGE_VS, 1);
+            if (P.gpl) lb_library(sh, gfx_shader_stage(sh) == GFX_STAGE_VS, keep);
             else lb_skip_lib();
         }
+        if (owned) gfx_shader_release_private(sh);
         plat_mutex_lock(&LB.stat);
         LB.done++;
         plat_mutex_unlock(&LB.stat);
@@ -3041,7 +3043,8 @@ static void lb_state(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     LB.samples = (uint8_t)(1u << bf);
 }
 
-// Boot: compute shaders of the warm list (recorded and prepared), then the first KEEP recorded graphics variants.
+// Boot: compute shaders of the warm list (recorded and prepared), then all recorded graphics variants (the first KEEP
+// kept in libs[], the rest warmed into the driver cache with their vertex output unions).
 static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     const char *e = cfg_value("TOTK_LIB_PREBUILD"), *ke = cfg_get("TOTK_LIB_PREBUILD_KEEP");
     const char *te = cfg_get("TOTK_LIB_PREBUILD_THREADS");   // no fixed default: a quarter of the CPUs when unset
@@ -3055,7 +3058,7 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     for (size_t i = 0; LB.e && i < total; i++)
         if (all[i].stage == GFX_STAGE_CS) LB.e[n++] = all[i];
     n_cs = n;
-    for (size_t i = 0; LB.e && i < total && (int32_t)(n - n_cs) < LB.keep_n; i++)
+    for (size_t i = 0; LB.e && i < total; i++)
         if (all[i].stage != GFX_STAGE_CS && all[i].prio == 0) LB.e[n++] = all[i];
     free(all);
     if (atoi(e) > 1 && (size_t)atoi(e) < n) n = (size_t)atoi(e);   // a count above 1 caps the list; 1 is plain on
@@ -3063,7 +3066,7 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
         free(LB.e), LB.e = NULL;
         return;
     }
-    LB.n = n;
+    LB.n = n, LB.n_cs = n_cs < n ? n_cs : n;
     lb_state(pr_hist, fs_hist);
     LB.idle = 1;
     int cpus = (int)plat_cpu_usable();
