@@ -1,4 +1,4 @@
-# Upstream Attribution & Patch Notes (`0.5.0+afae80c9-patch4`)
+# Upstream Attribution & Patch Notes (`0.5.0+afae80c9-patch5`)
 
 ## Original Source & Licensing
 
@@ -54,6 +54,16 @@ All original TotK Recomp code, architecture, lifter, runtime, installer, and doc
 - **Root Cause:** `cache_use` exclusive locking around `vkGetPipelineCacheData()` was added specifically for an Intel Iris Xe `igvk64.dll` driver crash (`#681`), but blocked concurrent pipeline creation during background autosaves on NVIDIA/AMD GPUs every 20 seconds.
 - **Fix:**
   - Scope `cache_use` locking to Intel GPUs (`vendorID == 0x8086`), allow concurrent `vkGetPipelineCacheData()` with headroom + up to 3 `VK_INCOMPLETE` retries on non-Intel GPUs, and raise the background autosave interval from `20 s` to `60 s`.
+
+### 5. Cutscene & New-Scene Black Objects / Screen During Pipeline Builds
+- **Files:** `runtime/vk_exec_draw.c`, `runtime/vk_pipeline.c`, `runtime/cfg.c`, `totk.ini.example`
+- **Root Cause:**
+  - `TOTK_PIPE_SKIP` defaulted to `fullscreen` (`2`), which skipped full-screen lighting/composite passes and all 3D geometry draws (`count > 6`) into recent render targets while background workers compiled missing shader/GPL pipeline state. At the start of in-engine cutscenes (where the scene reuses recent color/depth buffers while introducing new actor shaders/materials), skipping those draws rendered characters, objects, or the entire frame black for several frames until background builds completed.
+  - Boot-time stage library prebuilding (`lb_start()`) also skipped warming recorded priority-0 graphics shader variants into the driver disk cache whenever `TOTK_LIB_PREBUILD_KEEP=0`.
+- **Fix:**
+  - Change default `PIPE_SKIP` from `fullscreen` to `strict` (`0`).
+  - In `strict` mode (and for `any` when `vk_caps.gpl` is enabled), allow pending scene/cutscene draws (shaders and 3D geometry in `strict`, as well as full-screen passes) to share a bounded per-frame wait budget (`200 ms` in `strict`, `50 ms` in `any`) so GPL `lib_wait()` + fast-linking completes in the same frame instead of dropping draws to black; cache hits do not consume wait budget.
+  - Warm all recorded priority-0 vertex/fragment variants into the driver disk cache (`keep = 0`, releasing temporary shader/pipeline objects unless `TOTK_LIB_PREBUILD_KEEP > 0`) on idle-priority background threads after boot prewarm.
 
 ---
 
