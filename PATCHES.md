@@ -1,4 +1,4 @@
-# Upstream Attribution & Patch Notes (`0.5.0+afae80c9-patch9`)
+# Upstream Attribution & Patch Notes (`0.5.0+afae80c9-patch10`)
 
 ## Original Source & Licensing
 
@@ -91,6 +91,13 @@ All original TotK Recomp code, architecture, lifter, runtime, installer, and doc
 - **Fix:**
   - Add `water_lod_overlay()` in `runtime/romfs.c` (enabled by default via `water_lod_fix = 1` / `TOTK_WATER_LOD_FIX=1`; `0` disables; automatically skipped if a player mod overrides `terrain_water`).
   - At boot, unpack `Shader/terrain_water.*.bfsha.zs` from the player's own RomFS using `Pack/ZsDic.pack.zs`, dynamically parse the BFSHA `o_terrain_shader_lod` / `o_terrain_enable_deformable` / `o_terrain_water_is_quicksand` static options, and remap all 48 non-quicksand LOD 1/2 `ResShaderProgram` entries in place to their matching 1-to-1 LOD 0 entries (identical UBOs, strict-subset samplers, matching RLT pointer slots, identical decompressed size so no `ResourceSizeTable` edit is needed), serving the generated overlay from `<profile>/water_lod/`.
+
+### 9. Shrine Interior Feedback Snapshot Expansion (`patch10`)
+- **Files:** `runtime/vk_exec_draw.c`
+- **Root Cause:** `feedback_snapshot()` previously restricted eligibility to `VK_FORMAT_R32_SFLOAT` attachments with `levels == 1` and `layers == 1` and cached only one snapshot per pass (`feedback_pass_snap`). Inside shrines, telemetry (`feedback_debug = 1`) showed hundreds of feedback draws per window with `0 eligible, 0 copied`, leaving intra-draw feedback hazards on non-R32F or mipmapped color attachments unsnapshotted.
+- **Fix:**
+  - Generalize `feedback_copy_get()` (`FB_COPIES = 16`, `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT`, matching `src->format` and mip extent `mw x mh`) and `feedback_snapshot()` (per-slot `feedback_pass_snap[8]`, copying `{t->level, t->base_layer}` -> `{0, 0}` and clamping view mip/layer in `tex_info()`) to snapshot any eligible 2D color attachment in `mask & wmask` regardless of format or mip/layer count.
+  - Also log `!elig` feedback draws via `feedback_note()` when `feedback_debug = 1` for diagnostics.
 
 ---
 
