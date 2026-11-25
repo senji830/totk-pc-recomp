@@ -1,4 +1,4 @@
-# Upstream Attribution & Patch Notes (`0.5.0+afae80c9-patch8`)
+# Upstream Attribution & Patch Notes (`0.5.0+afae80c9-patch9`)
 
 ## Original Source & Licensing
 
@@ -84,6 +84,13 @@ All original TotK Recomp code, architecture, lifter, runtime, installer, and doc
   - Separate 3D geometry draws (`!full`) from full-screen passes (`full`) under `pipe_skip = any`: 3D geometry draws call `vk_pipeline_graphics_gpl_async()` with `wait_ms = 0`, fast-linking immediately (`~0.04 ms`) when both GPL stage libraries are already resident in RAM and handing cold library builds to background workers without stalling the render/replay thread.
   - Keep a shared atomic per-frame wait budget (`g_wait_frame`, `g_wait_left_ns`, default `25 ms` in `any` and `80 ms` in `strict`, overridable via `TOTK_PIPE_WAIT_MS`) for full-screen passes so multi-pass weather/sky/lighting transitions never flash dark/black.
   - Raise the default `TOTK_LIB_PREBUILD_KEEP` from `0` to `1024` for gameplay-recorded variants (`shader-answers.bin`, `prio == 0`) in `lb_start()` (~150–300 MB RAM) so frequently used stage libraries stay resident for instant GPL fast-linking.
+
+### 8. Distant Water Abrupt Color Shift / LOD Transition (`patch9`)
+- **Files:** `runtime/romfs.c`, `runtime/cfg.c`, `totk.ini.example`
+- **Root Cause:** `Shader/terrain_water.*.bfsha.zs` compiles three `o_terrain_shader_lod` tiers (`0` = near water with indirect refraction, `1`/`2` = mid/far water without it). Beyond the terrain water LOD cutoff distance, switching from LOD 0 to LOD 1/2 drops near refraction and snaps bodies of water abruptly to a flat region blue.
+- **Fix:**
+  - Add `water_lod_overlay()` in `runtime/romfs.c` (enabled by default via `water_lod_fix = 1` / `TOTK_WATER_LOD_FIX=1`; `0` disables; automatically skipped if a player mod overrides `terrain_water`).
+  - At boot, unpack `Shader/terrain_water.*.bfsha.zs` from the player's own RomFS using `Pack/ZsDic.pack.zs`, dynamically parse the BFSHA `o_terrain_shader_lod` / `o_terrain_enable_deformable` / `o_terrain_water_is_quicksand` static options, and remap all 48 non-quicksand LOD 1/2 `ResShaderProgram` entries in place to their matching 1-to-1 LOD 0 entries (identical UBOs, strict-subset samplers, matching RLT pointer slots, identical decompressed size so no `ResourceSizeTable` edit is needed), serving the generated overlay from `<profile>/water_lod/`.
 
 ---
 
