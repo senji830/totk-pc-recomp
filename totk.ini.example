@@ -151,6 +151,9 @@
 # squares on shrine cobblestone floors): 0 off, 1 reuse snapshot per pass (default), 2 snapshot every eligible draw.
 # feedback_r32_copy = 1
 # feedback_debug = 0
+# Keep near-detail water shaders (o_terrain_shader_lod = 0) across mid/far water LOD transitions to prevent distant
+# water from abruptly snapping to a flat region blue: 1 on (default), 0 off. Read at start.
+# water_lod_fix = 1
 # Optimisations, 0 turns each off: skip bindings that did not change, remember shader lookups, reuse the previous
 # draw's pipeline when its state repeats, remember texture descriptors between draws, update descriptors in bulk,
 # skip push constants that did not change, bind only the vertex buffers a draw reads, compare and copy each draw's

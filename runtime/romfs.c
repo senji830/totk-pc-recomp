@@ -929,6 +929,176 @@ static void camera_overlay(void) {
     if (ok && serve_generated(CAMPACK, base, out, out_n, "camera", "camera speed", keeps)) cam_pack_served();
 }
 
+// ---- distant water LOD color-shift fix (TOTK_WATER_LOD_FIX).
+// terrain_water.*.bfsha.zs ships three o_terrain_shader_lod tiers (0 = near with indirect refraction, 1/2 = mid/far
+// without it). Switching to LOD 1/2 makes bodies of water abruptly snap to a flat region blue past a fixed distance.
+// Every non-quicksand LOD 1/2 program has an exact 1-to-1 LOD 0 counterpart whose samplers and UBOs are a strict
+// subset of what the game binds and whose ResShaderProgram pointer slots match for BFSHA RLT relocation. Copying the
+// 64-byte ResShaderProgram entries in place keeps the decompressed size identical (no ResourceSizeTable change).
+static uint16_t wl_u16(const uint8_t *p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
+static uint32_t wl_u32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static uint64_t wl_u64(const uint8_t *p) { return (uint64_t)wl_u32(p) | ((uint64_t)wl_u32(p + 4) << 32); }
+
+typedef struct { unsigned want_id; const uint8_t *data; size_t size; } WaterDicPick;
+static void wl_pick_dic(const char *name, const uint8_t *data, size_t size, void *ctx) {
+    WaterDicPick *p = ctx;
+    if (p->data || !ends_with(name, ".zsdic")) return;
+    if (ZSTD_getDictID_fromDict(data, size) == p->want_id) p->data = data, p->size = size;
+}
+
+static int wl_match_str(const uint8_t *buf, size_t len, uint64_t off, const char *want) {
+    size_t wn = strlen(want);
+    if (off > len || len - off < 2) return 0;
+    uint16_t ln = wl_u16(buf + off);
+    return ln == wn && off + 2 + ln <= len && memcmp(buf + off + 2, want, wn) == 0;
+}
+
+static int water_lod_patch_bfsha(uint8_t *raw, size_t raw_n) {
+    if (raw_n < 0x180 || memcmp(raw, "FSHA    ", 8) != 0) return 0;
+    uint64_t sm = wl_u64(raw + 0x48);
+    if (sm > raw_n || raw_n - sm < 0x100) return 0;
+    uint64_t static_opt_arr = wl_u64(raw + sm + 0x08);
+    uint64_t prog_arr = wl_u64(raw + sm + 0x88);
+    uint64_t key_table = wl_u64(raw + sm + 0x90);
+    uint16_t static_cnt = wl_u16(raw + sm + 0xe4);
+    uint16_t prog_cnt = wl_u16(raw + sm + 0xe8);
+    uint8_t static_klen = raw[sm + 0xea], dyn_klen = raw[sm + 0xeb];
+    size_t stride = (size_t)static_klen + dyn_klen;
+    if (!static_cnt || !prog_cnt || !static_klen || !dyn_klen) return 0;
+    if (static_opt_arr > raw_n || (size_t)static_cnt * 0x28 > raw_n - static_opt_arr) return 0;
+    if (prog_arr > raw_n || (size_t)prog_cnt * 64 > raw_n - prog_arr) return 0;
+    if (key_table > raw_n || (size_t)prog_cnt * stride * 4 > raw_n - key_table) return 0;
+
+    int lod_idx = -1, def_idx = -1, qs_idx = -1;
+    uint32_t lod_mask = 0, def_mask = 0, qs_mask = 0;
+    uint8_t lod_shift = 0, def_shift = 0, qs_shift = 0;
+    for (uint16_t i = 0; i < static_cnt; i++) {
+        const uint8_t *o = raw + static_opt_arr + (size_t)i * 0x28;
+        uint64_t noff = wl_u64(o);
+        if (wl_match_str(raw, raw_n, noff, "o_terrain_shader_lod")) {
+            lod_mask = wl_u32(o + 32); lod_idx = o[36]; lod_shift = o[37];
+        } else if (wl_match_str(raw, raw_n, noff, "o_terrain_enable_deformable")) {
+            def_mask = wl_u32(o + 32); def_idx = o[36]; def_shift = o[37];
+        } else if (wl_match_str(raw, raw_n, noff, "o_terrain_water_is_quicksand")) {
+            qs_mask = wl_u32(o + 32); qs_idx = o[36]; qs_shift = o[37];
+        }
+    }
+    if (lod_idx < 0 || def_idx < 0 || qs_idx < 0 || lod_idx >= static_klen || def_idx >= static_klen ||
+        qs_idx >= static_klen)
+        return 0;
+
+    uint8_t *orig = malloc((size_t)prog_cnt * 64);
+    if (!orig) return 0;
+    memcpy(orig, raw + prog_arr, (size_t)prog_cnt * 64);
+
+    int replaced = 0;
+    for (uint16_t d = 0; d < prog_cnt; d++) {
+        const uint8_t *kd = raw + key_table + (size_t)d * stride * 4;
+        uint32_t qs = (wl_u32(kd + (size_t)qs_idx * 4) & qs_mask) >> qs_shift;
+        uint32_t lod = (wl_u32(kd + (size_t)lod_idx * 4) & lod_mask) >> lod_shift;
+        uint32_t def = (wl_u32(kd + (size_t)def_idx * 4) & def_mask) >> def_shift;
+        if (qs != 0 || lod == 0) continue;
+        for (uint16_t s = 0; s < prog_cnt; s++) {
+            const uint8_t *ks = raw + key_table + (size_t)s * stride * 4;
+            if (((wl_u32(ks + (size_t)qs_idx * 4) & qs_mask) >> qs_shift) != 0) continue;
+            if (((wl_u32(ks + (size_t)lod_idx * 4) & lod_mask) >> lod_shift) != 0) continue;
+            if (((wl_u32(ks + (size_t)def_idx * 4) & def_mask) >> def_shift) != def) continue;
+            if (memcmp(ks + (size_t)static_klen * 4, kd + (size_t)static_klen * 4, (size_t)dyn_klen * 4) != 0) continue;
+            const uint8_t *ps = orig + (size_t)s * 64, *pd = orig + (size_t)d * 64;
+            int ptr_ok = 1;
+            for (int k = 0; k < 6; k++)
+                if ((wl_u64(ps + k * 8) == 0) != (wl_u64(pd + k * 8) == 0)) ptr_ok = 0;
+            if (!ptr_ok) continue;
+            memcpy(raw + prog_arr + (size_t)d * 64, ps, 64);
+            replaced++;
+            break;
+        }
+    }
+    free(orig);
+    return replaced;
+}
+
+static void water_lod_overlay(void) {
+    if (!cfg_bool("TOTK_WATER_LOD_FIX")) return;
+    static const char prefix[] = "Shader/terrain_water.";
+    uint64_t idx = lower(prefix);
+    const char *rel = NULL;
+    for (uint64_t i = idx; i < file_count; i++) {
+        const char *name = entry_name(entry(i));
+        if (strncmp(name, prefix, sizeof prefix - 1) != 0) break;
+        if (ends_with(name, ".bfsha.zs")) { rel = name; break; }
+    }
+    if (!rel) return;
+    static const char keeps[] = "water keeps its stock LOD shaders";
+    Overlay *base, *dic_base;
+    size_t n = 0, dn = 0;
+    void *in = read_served(rel, &base, &n, keeps);
+    if (!in) return;
+    if (base && base->mod) { free(in); return; }   // respect a player mod's terrain_water shader
+    void *dic_z = read_served("Pack/ZsDic.pack.zs", &dic_base, &dn, keeps);
+    if (!dic_z) { free(in); return; }
+
+    unsigned long long dic_raw_n = ZSTD_getFrameContentSize(dic_z, dn);
+    unsigned long long raw_n = ZSTD_getFrameContentSize(in, n);
+    unsigned want_id = ZSTD_getDictID_fromFrame(in, n);
+    uint8_t *dic_raw = NULL, *raw = NULL, *out = NULL;
+    ZSTD_DCtx *dctx = NULL;
+    ZSTD_CCtx *cctx = NULL;
+    ZSTD_DDict *dd = NULL;
+    ZSTD_CDict *cd = NULL;
+    size_t out_n = 0;
+    int patched = 0;
+
+    if (dic_raw_n != ZSTD_CONTENTSIZE_UNKNOWN && dic_raw_n != ZSTD_CONTENTSIZE_ERROR && dic_raw_n <= (16u << 20) &&
+        raw_n != ZSTD_CONTENTSIZE_UNKNOWN && raw_n != ZSTD_CONTENTSIZE_ERROR && raw_n <= (16u << 20)) {
+        dic_raw = malloc((size_t)dic_raw_n);
+        raw = malloc((size_t)raw_n);
+        if (dic_raw && raw && ZSTD_decompress(dic_raw, (size_t)dic_raw_n, dic_z, dn) == dic_raw_n) {
+            WaterDicPick pick = {want_id, NULL, 0};
+            if (want_id) restbl_sarc_each(dic_raw, (size_t)dic_raw_n, wl_pick_dic, &pick);
+            dctx = ZSTD_createDCtx();
+            size_t got = 0;
+            if (dctx && (!want_id || pick.data)) {
+                if (want_id) {
+                    dd = ZSTD_createDDict(pick.data, pick.size);
+                    got = dd ? ZSTD_decompress_usingDDict(dctx, raw, (size_t)raw_n, in, n, dd) : 0;
+                } else {
+                    got = ZSTD_decompressDCtx(dctx, raw, (size_t)raw_n, in, n);
+                }
+            }
+            if (got == raw_n && (patched = water_lod_patch_bfsha(raw, (size_t)raw_n)) > 0) {
+                size_t cap = ZSTD_compressBound((size_t)raw_n);
+                out = malloc(cap);
+                cctx = ZSTD_createCCtx();
+                if (out && cctx) {
+                    if (want_id) {
+                        cd = ZSTD_createCDict(pick.data, pick.size, 9);
+                        out_n = cd ? ZSTD_compress_usingCDict(cctx, out, cap, raw, (size_t)raw_n, cd) : 0;
+                    } else {
+                        out_n = ZSTD_compressCCtx(cctx, out, cap, raw, (size_t)raw_n, 9);
+                    }
+                    if (!out_n || ZSTD_isError(out_n)) { free(out); out = NULL; out_n = 0; }
+                }
+            }
+        }
+    }
+    if (cd) ZSTD_freeCDict(cd);
+    if (dd) ZSTD_freeDDict(dd);
+    if (cctx) ZSTD_freeCCtx(cctx);
+    if (dctx) ZSTD_freeDCtx(dctx);
+    free(dic_raw);
+    free(raw);
+    free(dic_z);
+    free(in);
+    if (out) {
+        char what[64];
+        snprintf(what, sizeof what, "water LOD 0 (%d shaders)", patched);
+        serve_generated(rel, base, out, out_n, "water_lod", what, keeps);
+    }
+}
+
 // The button prompts' folders (input_prompts_folder) and whether each had a manifest next to romfs-index.bin at start;
 // the one the settings asked for at start, the one overlay_init loaded (NULL: the game's own prompts) and why the first
 // did not load (ROMFS_PROMPTS_*). The menu compares them with the settings in effect (ui/menu.cpp prompts_note).
@@ -1142,6 +1312,7 @@ static void overlay_init(void) {
     restbl_overlay();
     heapdef_overlay();
     camera_overlay();
+    water_lod_overlay();
     added_init();
     if (noverlay) qsort(overlays, noverlay, sizeof *overlays, overlay_order);
     for (size_t k = 1; k < noverlay; k++)   // overlay_contest left one per file; the generated ones replace in place
