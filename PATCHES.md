@@ -1,4 +1,4 @@
-# Upstream Attribution & Patch Notes (`0.5.0+afae80c9-patch7`)
+# Upstream Attribution & Patch Notes (`0.5.0+afae80c9-patch8`)
 
 ## Original Source & Licensing
 
@@ -74,6 +74,16 @@ All original TotK Recomp code, architecture, lifter, runtime, installer, and doc
 - **Fix:**
   - Add `gfx_shader_warm_svc()` (invoked from `rt_boot()` after boot prewarm when `vk_pipeline_async_on()`) to start `xlate` workers and pre-spawn one idle `totk_xlate.exe --serve` child with an initial handshake on a `PLAT_PRIO_BELOW_NORMAL` background thread without adding boot delay.
   - In `xlate_worker()`, load the translated SPIR-V into memory (`mem_insert` + `use_put`) and broadcast `X.done` to wake `gfx_shader_await()` first, then execute `translate_persist()` (`plat_file_flush`, `plat_file_replace`, `use_store`, `in_store`) afterwards off the render thread's critical path.
+
+### 7. Weapon/Shield-Swap Pipeline Stutter & Weather-Change Full-Screen Pass Protection (`patch8`)
+- **Files:** `runtime/vk_exec_draw.c`, `runtime/vk_pipeline.c`
+- **Root Cause:**
+  - Under `pipe_skip = any`, first-time 3D geometry draws (such as equipping a new weapon or shield after a fresh install) waited synchronously on `lib_wait()` (`2–6 ms` per draw) because `TOTK_LIB_PREBUILD_KEEP` defaulted to `0` (destroying warmed stage library handles from RAM after boot prebuild).
+  - The per-frame pipeline wait budget (`D->wait_left_ns`) was tracked per `DrawState` worker rather than shared across `replay_workers`, allowing parallel workers to multiply the per-frame wait.
+- **Fix:**
+  - Separate 3D geometry draws (`!full`) from full-screen passes (`full`) under `pipe_skip = any`: 3D geometry draws call `vk_pipeline_graphics_gpl_async()` with `wait_ms = 0`, fast-linking immediately (`~0.04 ms`) when both GPL stage libraries are already resident in RAM and handing cold library builds to background workers without stalling the render/replay thread.
+  - Keep a shared atomic per-frame wait budget (`g_wait_frame`, `g_wait_left_ns`, default `25 ms` in `any` and `80 ms` in `strict`, overridable via `TOTK_PIPE_WAIT_MS`) for full-screen passes so multi-pass weather/sky/lighting transitions never flash dark/black.
+  - Raise the default `TOTK_LIB_PREBUILD_KEEP` from `0` to `1024` for gameplay-recorded variants (`shader-answers.bin`, `prio == 0`) in `lb_start()` (~150–300 MB RAM) so frequently used stage libraries stay resident for instant GPL fast-linking.
 
 ---
 

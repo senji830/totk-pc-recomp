@@ -62,7 +62,7 @@ def verify_symbols(rt_dir, llvm):
         if 'gfx_last_flip_ns' not in r.stdout or 'vk_pipeline_graphics_gpl_async' not in r.stdout or 'gfx_shader_warm_svc' not in r.stdout:
             sys.exit(f'{lib_name}: missing patched symbols (gfx_last_flip_ns / vk_pipeline_graphics_gpl_async / gfx_shader_warm_svc)')
         blob = lib.read_bytes()
-        for marker in (b'FEEDBACK_R32_COPY', b'linear-depth feedback snapshot', b'cache %s: %.1f MB copied'):
+        for marker in (b'FEEDBACK_R32_COPY', b'linear-depth feedback snapshot', b'cache %s: %.1f MB copied', b'TOTK_PIPE_WAIT_MS'):
             if marker not in blob:
                 sys.exit(f'{lib_name}: missing expected patch marker {marker!r}')
         print(f'symbols ok: {lib_name} ({lib.stat().st_size / (1 << 20):.2f} MiB)')
@@ -73,7 +73,7 @@ def main():
     ap.add_argument('--base', type=Path, required=True, help='existing TotK-Setup-0.5.0-windows folder (pinned toolchain/deps)')
     ap.add_argument('--gen', type=Path, required=True, help='directory holding layout.h and layout.json (read-only)')
     ap.add_argument('--out', type=Path, required=True, help='output patched setup folder (replaced)')
-    ap.add_argument('--version-str', default='0.5.0+afae80c9-patch7', help='VERSION string written to the release folder')
+    ap.add_argument('--version-str', default='0.5.0+afae80c9-patch8', help='VERSION string written to the release folder')
     ap.add_argument('--zip', type=Path, help='optional output zip path')
     args = ap.parse_args()
 
