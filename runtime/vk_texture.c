@@ -1316,11 +1316,13 @@ static int img_block(const Tex *e, int *bw, int *bh) {
     return e->f.vk == e->f.ideal ? b : 0;
 }
 
-// The new entry e can take src's content texel for texel: colour, one sample, the same shape and storage layout, and
-// image formats of one block size.
+// The new entry e can take src's content texel for texel: colour, one sample, the same shape, storage layout, and
+// texel format (sRGB aside; matching slot_resolve, so transient pool reuse across unrelated 32-bit formats like R32F
+// and RGBA8 does not copy raw float bits into a fresh UI capture target).
 static int alias_compatible(const Tex *e, const Tex *src) {
     const VkTexImage *p = &e->pub, *q = &src->pub;
     if (e->f.depth || e->f.stencil || src->f.depth || src->f.stencil || p->samples > 1 || q->samples > 1) return 0;
+    if (linear_format(e->key.d.format) != linear_format(src->key.d.format)) return 0;
     if (p->type != q->type || p->width != q->width || p->height != q->height || p->depth != q->depth) return 0;
     if (e->t.L.size != src->t.L.size || nvn_tex_is_linear(&e->t.d) != nvn_tex_is_linear(&src->t.d)) return 0;
     int ew, eh, sw, sh, eb = img_block(e, &ew, &eh), sb = img_block(src, &sw, &sh);
@@ -1379,7 +1381,8 @@ static int alias_copy(Tex *e, const Tex *src) {
                            .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
                            .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT};
     VkImageMemoryBarrier2 ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
-                                .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT,
+                                .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
                                 .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
                                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                                 .image = e->pub.image,
@@ -1387,6 +1390,15 @@ static int alias_copy(Tex *e, const Tex *src) {
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb,
                            .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &ib};
     vkCmdPipelineBarrier2(cb, &di);
+    if ((e->pub.levels > levels || e->pub.layers > layers) && vk_fix_zero() && !e->bound_to && !e->pub.mirrored &&
+        !format_compressed(e->f.vk)) {
+        // Clear mip levels / array layers that src does not have so they do not hold uninitialised VRAM.
+        VkClearColorValue zero = {0};
+        VkImageSubresourceRange zrg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+        vkCmdClearColorImage(cb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &zrg);
+        barrier(cb, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    }
     vkCmdCopyBufferToImage(cb, buf, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, n, rg);
     barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
     vk_exec_inline_end(reopen);

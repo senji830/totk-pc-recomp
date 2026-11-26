@@ -92,6 +92,13 @@ All original TotK Recomp code, architecture, lifter, runtime, installer, and doc
   - Add `water_lod_overlay()` in `runtime/romfs.c` (enabled by default via `water_lod_fix = 1` / `TOTK_WATER_LOD_FIX=1`; `0` disables; automatically skipped if a player mod overrides `terrain_water`).
   - At boot, unpack `Shader/terrain_water.*.bfsha.zs` from the player's own RomFS using `Pack/ZsDic.pack.zs`, dynamically parse the BFSHA `o_terrain_shader_lod` / `o_terrain_enable_deformable` / `o_terrain_water_is_quicksand` static options, and remap all 48 non-quicksand LOD 1/2 `ResShaderProgram` entries in place to their matching 1-to-1 LOD 0 entries (identical UBOs, strict-subset samplers, matching RLT pointer slots, identical decompressed size so no `ResourceSizeTable` edit is needed), serving the generated overlay from `<profile>/water_lod/`.
 
+### 9. Shrine Dialogue / Light of Blessing Text Box Background Square under `tex_alias = 1` (upstream `#938`)
+- **Files:** `runtime/vk_texture.c`
+- **Root Cause:** `alias_compatible()` checked only block byte size (`eb == sb`) and geometry, omitting the `linear_format()` match that `slot_resolve()` already enforces. When TotK reused the same transient pool address for unrelated 32-bit formats (e.g., a live `R32F` target and a new `RGBA8` `ui2d` capture target at the same address), `alias_copy()` copied raw float bits (with non-zero alpha bytes) into the new `RGBA8` capture target instead of zero-clearing it, producing a solid/corrupted square behind blurred shrine text. In addition, `alias_copy()` transitioned all mip levels / array layers of `e` from `UNDEFINED -> GENERAL` while only copying `min(e->levels, src->levels)` and `min(e->layers, src->layers)`, leaving extra mips/layers uninitialised.
+- **Fix:**
+  - Require `linear_format(e->key.d.format) == linear_format(src->key.d.format)` in `alias_compatible()`, matching `slot_resolve()` so same-format aliases (including sRGB/linear and swizzle views) keep working while cross-format pool reuse falls back cleanly to `init_new()`.
+  - Clear `e` to `{0,0,0,0}` before `vkCmdCopyBufferToImage` in `alias_copy()` when `e` has more mip levels or array layers than `src` (and `vk_fix_zero() && !e->bound_to && !e->pub.mirrored && !format_compressed(e->f.vk)`), with `VK_PIPELINE_STAGE_2_CLEAR_BIT` included in the initial image barrier.
+
 ---
 
 ## Rebuilding the Patched Setup Locally
