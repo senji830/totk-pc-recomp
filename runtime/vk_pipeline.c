@@ -3538,7 +3538,7 @@ static void autosave_once(void) {
     int busy;
     plat_mutex_lock_shared(&P.lock);
     s = P.stats;
-    busy = A.high != NULL || U.head != NULL;
+    busy = A.head != NULL || U.head != NULL;
     plat_mutex_unlock_shared(&P.lock);
     uint64_t total = s.graphics + s.compute;
     if (total == last_n || busy) return;
