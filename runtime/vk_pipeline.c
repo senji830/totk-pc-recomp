@@ -108,6 +108,8 @@ static struct {
 // boot's pipeline builds (#681). Nothing is taken while it is held.
 static PlatMutex cache_use = PLAT_MUTEX_INIT;
 static int cache_sync;   // Intel igvk64.dll workaround (#681): lock cache_use around vkGetPipelineCacheData only on Intel GPUs
+static volatile int32_t cache_copying;   // 1 while vkGetPipelineCacheData is copying P.cache (driver may lock P.cache)
+extern int menu_is_open(void);
 
 typedef struct Layout {
     struct Layout *next;
@@ -2404,6 +2406,9 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
                : U.on ? "has its libraries built in parallel on the workers, ahead of other jobs"
                       : "builds its libraries itself (TOTK_PIPE_WAIT=draw)");
     }
+    // While background cache_save copies P.cache (e.g. 700+ MB on NVIDIA), the driver holds an internal lock on
+    // P.cache for ~200 ms. Non-oneshot draws skip waiting rather than stalling the render thread on that lock.
+    if (wait_ms && wait_ms < 1000 && __atomic_load_n(&cache_copying, __ATOMIC_ACQUIRE)) wait_ms = 0;
     double end = (p && p->building && wait_ms) ? now_ms() + wait_ms : 0;
     if (p && p->building && P.gpl && !p->info.pipeline && !p->fast_tried && p->lay && p->lay->set1 && !k.fbl) {
         int final = 0, build = wait_ms != 0 && draw_build;
@@ -3492,6 +3497,7 @@ static void cache_save(int wait) {
     size_t size = 0;
     void *data = NULL;
     int ok = 0;
+    __atomic_store_n(&cache_copying, 1, __ATOMIC_RELEASE);
     for (int attempt = 0; attempt < 3 && !ok; attempt++) {
         if (vkGetPipelineCacheData(P.device, P.cache, &size, NULL) != VK_SUCCESS || !size) break;
         size_t cap = locked ? size : size + (size >> 4) + 65536;
@@ -3503,6 +3509,7 @@ static void cache_save(int wait) {
         if (r == VK_SUCCESS) { size = got_sz; ok = 1; }
         else if (r != VK_INCOMPLETE) break;
     }
+    __atomic_store_n(&cache_copying, 0, __ATOMIC_RELEASE);
     if (locked) plat_mutex_unlock(&cache_use);
     // The copy time is how long a pipeline build on the drawing thread (a compute miss, under P.lock) can wait for
     // this save; the wait is how long the save waited for builds in flight.
@@ -3516,18 +3523,31 @@ static void cache_save(int wait) {
 void vk_pipeline_save(void) { cache_save(1); }
 
 // The game never shuts the device down (boot.c and the window end the process), so the cache is saved while it
-// runs: at most every 60 s, and only after new pipelines were built. New pipeline keys are appended every 2 s.
+// runs, and always on exit (vk_pipeline_save). Prefer saving while the overlay menu is open (>= 60 s), or during
+// quiet gameplay every 5 min when >= 32 new pipelines were built (10 min fallback for smaller counts), so copying a
+// 700+ MB driver cache does not contend with mid-gameplay shader builds. New pipeline keys are appended every 2 s.
 static void autosave_once(void) {
     static uint64_t last_n, last_ms, last_keys;
     if (!P.ready) return;
     uint64_t now = plat_now_ms();
     if (*(volatile uint32_t *)&K.pend_n && now - last_keys >= 2000) last_keys = now, keys_flush();
     gfx_shader_record_flush(0);
-    if (now - last_ms < 60000) return;
+    uint64_t elapsed = now - last_ms;
+    if (elapsed < 60000) return;
     VkPipeStats s;
-    vk_pipeline_stats(&s);
-    if (s.graphics + s.compute == last_n) return;
-    last_n = s.graphics + s.compute, last_ms = now;
+    int busy;
+    plat_mutex_lock_shared(&P.lock);
+    s = P.stats;
+    busy = A.high != NULL || U.head != NULL;
+    plat_mutex_unlock_shared(&P.lock);
+    uint64_t total = s.graphics + s.compute;
+    if (total == last_n || busy) return;
+    uint64_t diff = total - last_n;
+    if (!menu_is_open()) {
+        if (elapsed < 300000) return;
+        if (diff < 32 && elapsed < 600000) return;
+    }
+    last_n = total, last_ms = now;
     cache_save(0);
 }
 

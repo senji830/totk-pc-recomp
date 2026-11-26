@@ -99,9 +99,12 @@ All original TotK Recomp code, architecture, lifter, runtime, installer, and doc
   - Require `linear_format(e->key.d.format) == linear_format(src->key.d.format)` in `alias_compatible()`, matching `slot_resolve()` so same-format aliases (including sRGB/linear and swizzle views) keep working while cross-format pool reuse falls back cleanly to `init_new()`.
   - Clear `e` to `{0,0,0,0}` before `vkCmdCopyBufferToImage` in `alias_copy()` when `e` has more mip levels or array layers than `src` (and `vk_fix_zero() && !e->bound_to && !e->pub.mirrored && !format_compressed(e->f.vk)`), with `VK_PIPELINE_STAGE_2_CLEAR_BIT` included in the initial image barrier.
 
-### 10. Default `replay_async = 1` (`0.5.1`)
-- **Files:** `runtime/cfg.c`, `totk.ini.example`
-- **Change:** Enable `replay_async = 1` by default so NVN submissions replay on their own thread for smoother frame pacing where the game waits for the GPU (`replay_async = 0` in `totk.ini` disables it).
+### 10. Default `replay_async = 1` & Non-Stalling Pipeline Cache Autosave (`0.5.1`)
+- **Files:** `runtime/cfg.c`, `totk.ini.example`, `runtime/vk_pipeline.c`
+- **Change:**
+  - Enable `replay_async = 1` by default so NVN submissions replay on their own thread for smoother frame pacing where the game waits for the GPU (`replay_async = 0` in `totk.ini` disables it).
+  - Track `cache_copying` around `vkGetPipelineCacheData()` in `cache_save()` so non-oneshot draws skip waiting (`wait_ms = 0`) instead of stalling ~200 ms on NVIDIA's internal `VkPipelineCache` lock during a 700+ MB cache copy.
+  - Prefer running background `autosave_once()` when the overlay menu is open (`>= 60 s`) or during quiet gameplay (`>= 5 min` with `>= 32` new pipelines, `10 min` fallback, and no urgent pipeline builds in flight).
 
 ---
 
