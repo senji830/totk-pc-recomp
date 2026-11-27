@@ -3748,35 +3748,46 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     // A draw of at most 6 vertices over half the render area or more (a full-screen triangle or quad, a tile) or, in
     // strict mode, any draw whose pipeline is building waits from a shared per-frame budget (80 ms in strict, 25 ms in
     // any; TOTK_PIPE_WAIT_MS overrides it, TOTK_PIPE_SKIP=fullscreen skips them instead). Under any (default), 3D
-    // geometry draws fast-link immediately (~0.04 ms) when both GPL stage libraries are already resident in RAM and
-    // otherwise hand off to background workers without blocking the render/replay thread. A one-shot draw waits
-    // without budget.
+    // geometry draws also get a small shared per-frame GPL-only wait budget (default 8 ms, TOTK_PIPE_GEOM_WAIT_MS)
+    // so new cutscene characters / models build their ~1 ms shader libraries on frame 1 instead of popping in late,
+    // without ever blocking on slow monolithic compiles. A one-shot draw waits without budget.
     static uint64_t g_wait_frame;
     static int64_t g_wait_left_ns;
+    static int64_t g_geom_left_ns;
     int full = count <= 6 && (uint64_t)sc.extent.width * sc.extent.height * 2 >= (uint64_t)ex->pass_w * ex->pass_h;
     int gpl_only = 0;
     uint32_t wait_ms = 0;
     uint64_t t0 = 0;
     if (oneshot > 0) {
         wait_ms = ONESHOT_WAIT_MS;
-    } else if (skip == 0 || (skip < 2 && full)) {
-        static int64_t budget_ns = -1;
+    } else if (skip == 0 || (skip < 2 && (full || vk_caps.gpl))) {
+        static int64_t budget_ns = -1, geom_budget_ns = -1;
         if (budget_ns < 0) {
             const char *we = cfg_get("TOTK_PIPE_WAIT_MS");
             int ms = we && *we ? atoi(we) : (skip == 0 ? 80 : 25);
             if (ms < 0) ms = 0;
             if (ms > 200) ms = 200;
             budget_ns = (int64_t)ms * 1000000LL;
+            const char *ge = cfg_get("TOTK_PIPE_GEOM_WAIT_MS");
+            int gms = ge && *ge ? atoi(ge) : 8;
+            if (gms < 0) gms = 0;
+            if (gms > 50) gms = 50;
+            geom_budget_ns = (int64_t)gms * 1000000LL;
         }
         uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
         uint64_t prev = __atomic_load_n(&g_wait_frame, __ATOMIC_RELAXED);
-        if (f != prev && __atomic_compare_exchange_n(&g_wait_frame, &prev, f, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+        if (f != prev && __atomic_compare_exchange_n(&g_wait_frame, &prev, f, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
             __atomic_store_n(&g_wait_left_ns, budget_ns, __ATOMIC_RELEASE);
-        int64_t left = __atomic_load_n(&g_wait_left_ns, __ATOMIC_ACQUIRE);
-        wait_ms = left > 0 ? (uint32_t)(left / 1000000) : 0;
-    } else if (skip < 2 && vk_caps.gpl) {
-        gpl_only = 1;
-        wait_ms = 0;
+            __atomic_store_n(&g_geom_left_ns, geom_budget_ns, __ATOMIC_RELEASE);
+        }
+        if (skip == 0 || full) {
+            int64_t left = __atomic_load_n(&g_wait_left_ns, __ATOMIC_ACQUIRE);
+            wait_ms = left > 0 ? (uint32_t)(left / 1000000) : 0;
+        } else {
+            gpl_only = 1;
+            int64_t left = __atomic_load_n(&g_geom_left_ns, __ATOMIC_ACQUIRE);
+            wait_ms = left > 0 ? (uint32_t)(left / 1000000) : 0;
+        }
     }
     // The previous draw's pipeline while its state repeats (PM, TOTK_PIPE_MEMO=0 turns it off): the cache key is made
     // from the state alone, and a pipeline once found only changes from its fast link to its optimised build, read
@@ -3804,15 +3815,16 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         if (t0) {
             int64_t spent = (int64_t)(kern_now_ns() - t0);
             if (spent >= 50000) {
-                int64_t cur = __atomic_load_n(&g_wait_left_ns, __ATOMIC_RELAXED);
+                int64_t *bucket = gpl_only ? &g_geom_left_ns : &g_wait_left_ns;
+                int64_t cur = __atomic_load_n(bucket, __ATOMIC_RELAXED);
                 while (cur > 0) {
                     int64_t nxt = spent < cur ? cur - spent : 0;
-                    if (__atomic_compare_exchange_n(&g_wait_left_ns, &cur, nxt, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+                    if (__atomic_compare_exchange_n(bucket, &cur, nxt, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
                         break;
                 }
             }
         }
-        why = oneshot > 0 ? "one-shot, shader" : wait_ms ? (full ? "full-screen" : "draw") : NULL;
+        why = oneshot > 0 ? "one-shot, shader" : wait_ms ? (gpl_only ? "geom" : full ? "full-screen" : "draw") : NULL;
         if (pending && oneshot < 0 && !vk_exec_targets_recent(ex, skip >= 1)) {
             perf_count(PERF_CNT_ONESHOT_WAIT);
             why = "one-shot";

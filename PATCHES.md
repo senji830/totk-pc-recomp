@@ -105,6 +105,7 @@ All original TotK Recomp code, architecture, lifter, runtime, installer, and doc
   - Enable `replay_async = 1` by default so NVN submissions replay on their own thread for smoother frame pacing where the game waits for the GPU (`replay_async = 0` in `totk.ini` disables it).
   - Track `cache_copying` around `vkGetPipelineCacheData()` in `cache_save()` so non-oneshot draws skip waiting (`wait_ms = 0`) instead of stalling ~200 ms on NVIDIA's internal `VkPipelineCache` lock during a 700+ MB cache copy.
   - Prefer running background `autosave_once()` when the overlay menu is open (`>= 60 s`) or during quiet gameplay (`>= 5 min` with `>= 32` new pipelines, `10 min` fallback, and no urgent pipeline builds in flight).
+  - Give 3D geometry draws (`!full`) under `pipe_skip = any` a small shared per-frame GPL-only wait budget (`TOTK_PIPE_GEOM_WAIT_MS`, default `8 ms`) so new cutscene characters build their `~1 ms` stage libraries and render on frame 1 instead of popping in late, while still never blocking on monolithic compiles.
 
 ---
 
