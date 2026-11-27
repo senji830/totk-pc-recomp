@@ -59,6 +59,7 @@ typedef struct Tex {
     uint8_t run;                  // frames in a row up to run_frame with a GPU write, counted up to WB_RUN
     uint64_t wr_fence;            // any entry: newest submission recorded to write its image (render, copy, clear,
                                   // storage binding); ReadTexels waits for it instead of draining the replay queue
+    uint64_t wr_seq;              // monotonic GPU write order across all entries (vk_texture_gpu_written)
     uint8_t listed;               // in owned[]
     uint8_t eager_cand;           // in eager_c[]: rendered by the value being recorded, snapshot not taken yet
     struct EagerSnap *eager;      // wb_eager: the staging copy of the image that value eager->value ended with
@@ -596,6 +597,7 @@ static void rel_unlink(Tex *e) {
 // A clock read per submit, for stamps on paths that run many times a frame.
 static uint64_t coarse_ms;
 static uint64_t use_counter;
+static uint64_t wr_counter;
 
 // How long released entries wait until the game takes them back, split into those holding GPU-written content and the
 // others (TOTK_TRACE=perf, vk_texture_released_log): where transient textures end and the tail that can go begins.
@@ -1463,14 +1465,17 @@ static Tex *entry_of(const tex_t *t) {
             if (p->released) { destroy_tex(p); continue; }
             alias = 1;
             if (!live_at(p, pos)) continue;   // the scan revives it at a later op: released at this chunk's
-            if (tex_alias && (!src || (same_but_swizzle(&p->key, &k) && !same_but_swizzle(&src->key, &k))) &&
-                alias_compatible(e, p) && alias_has_gpu_content(p, pos))
-                src = p;
+            if (tex_alias && alias_compatible(e, p) && alias_has_gpu_content(p, pos)) {
+                int p_swz = same_but_swizzle(&p->key, &k);
+                int s_swz = src ? same_but_swizzle(&src->key, &k) : 0;
+                if (!src || (p_swz && !s_swz) || (p_swz == s_swz && p->wr_seq > src->wr_seq)) src = p;
+            }
         }
         if (alias) perf_count(PERF_CNT_TEX_ALIAS);
         if (tex_alias) {
             if (src && alias_copy(e, src)) {
                 n_alias_copied++;
+                e->wr_seq = src->wr_seq;
                 if (e->pub.mirrored) {   // the content is src's GPU render, newer than the storage bytes
                     vk_mem_changed(e->pub.addr, e->t.L.size, 0, &e->wgen);
                     e->uploaded = 1;
@@ -1628,6 +1633,10 @@ void vk_texture_gpu_written(const tex_t *t) {
         e->pub.gpu_owned = 1;
         uint64_t f = vk_exec_recording_fence();
         if (f > e->wr_fence) e->wr_fence = f;
+        e->wr_seq = ++wr_counter;
+        // If another descriptor shares this storage address (e.g. a live (A,A,A,A) sampler view over an RGBA8 UI
+        // render target), invalidate slot caches for this address so sampling follows this fresher GPU render.
+        if (e->next_at || nvn_hm_get(&by_addr, &e->key.addr) != e) tex_gen_bump(e->key.addr);
         if (e->pub.mirrored) {
             e->gpu_dirty = 1;
             storage_rewritten(e, 0, &e->gpu_gen);   // CPU writes up to here are older than this render
@@ -1726,23 +1735,35 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view, uint32_t pos) 
     make_key(&s->t, &k);
     Tex *e = nvn_hm_get(&by_key, &k);
     if (!e || !live_at(e, pos)) {   // MNG hle_nvn.c: a finalized slot follows the live texture at its storage
-        // Prefer the live entry that differs from the slot descriptor only in its swizzle: transient render targets
-        // share storage, and the newest one at the address is usually another size. The map screen samples its
-        // 2250x1080 map target through an (R,G,B,1) descriptor and followed a 960x60 target at the same address.
-        // Only an entry of the slot's texel format follows (sRGB aside): Maxwell reads the storage through the slot
-        // descriptor's format, and an entry of another format holds another texture's texels. The quick menu samples
-        // its 768x432 RGB10A2 scene capture through a slot whose entry was released; after a fuse the Autobuild
-        // thumbnail of the fused object, RGBA8 at the same storage, was the live entry, and the menu drew it behind
-        // the wheel (the object's silhouette, or garbled colours). Without such an entry the released one keeps the
-        // slot: its image holds what was last written through that descriptor.
-        Tex *own = e, *any = NULL;
-        e = NULL;
+        // Prefer the live entry of the slot's texel format (sRGB aside) with the closest match (exact key apart from
+        // swizzle > same geometry & levels > same geometry > any same-format live entry), breaking ties by most recent
+        // GPU write (wr_seq) then use_seq.
+        Tex *own = e, *best = NULL;
+        int best_tier = -1;
         for (Tex *p = nvn_hm_get(&by_addr, &k.addr); p; p = p->next_at) {
             if (!live_at(p, pos) || linear_format(p->key.d.format) != linear_format(k.d.format)) continue;
-            if (!any) any = p;
-            if (same_but_swizzle(&p->key, &k)) { e = p; break; }
+            int same_geo = p->key.d.target == k.d.target && p->key.d.width == k.d.width &&
+                           p->key.d.height == k.d.height && p->key.d.depth == k.d.depth;
+            int tier = same_but_swizzle(&p->key, &k) ? 3
+                     : same_geo && p->key.d.levels == k.d.levels ? 2
+                     : same_geo ? 1 : 0;
+            if (!best || tier > best_tier ||
+                (tier == best_tier && (p->wr_seq > best->wr_seq || (p->wr_seq == best->wr_seq && p->use_seq > best->use_seq))))
+                best = p, best_tier = tier;
         }
-        if (!e) e = any ? any : own;
+        e = best ? best : own;
+    } else if (e->next_at || nvn_hm_get(&by_addr, &k.addr) != e) {
+        // Even when e is live in by_key, another live same-format, same-geometry descriptor at the same storage (e.g.
+        // an RGBA8 UI render target aliased by an (A,A,A,A) sampler descriptor) may hold a newer GPU render.
+        Tex *best = e;
+        for (Tex *p = nvn_hm_get(&by_addr, &k.addr); p; p = p->next_at) {
+            if (p == e || !live_at(p, pos) || linear_format(p->key.d.format) != linear_format(k.d.format)) continue;
+            if (p->key.d.target != k.d.target || p->key.d.width != k.d.width ||
+                p->key.d.height != k.d.height || p->key.d.depth != k.d.depth)
+                continue;
+            if (p->wr_seq > best->wr_seq && alias_has_gpu_content(p, pos)) best = p;
+        }
+        e = best;
     }
     TexSlot copy;   // entry_of may release the lock (a chunk's wait), and a registration then moves tslots
     if (!e && s->t.mem) copy = *s, s = &copy, e = entry_of(&s->t);
