@@ -73,7 +73,7 @@ def main():
     ap.add_argument('--base', type=Path, required=True, help='existing TotK-Setup-0.5.0-windows folder (pinned toolchain/deps)')
     ap.add_argument('--gen', type=Path, required=True, help='directory holding layout.h and layout.json (read-only)')
     ap.add_argument('--out', type=Path, required=True, help='output patched setup folder (replaced)')
-    ap.add_argument('--version-str', default='0.5.1+afae80c9', help='VERSION string written to the release folder')
+    ap.add_argument('--version-str', default='0.5.2+afae80c9', help='VERSION string written to the release folder')
     ap.add_argument('--zip', type=Path, help='optional output zip path')
     args = ap.parse_args()
 
