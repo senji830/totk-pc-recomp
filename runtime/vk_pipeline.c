@@ -2329,7 +2329,7 @@ static void job_lower(Job *j) {
 // A draw waits for pipeline s: its missing pre-rasterization and fragment shader libraries go to the head of the
 // worker queues (U), so they build in parallel on idle workers, and this thread sleeps until both are published or
 // end (now_ms) passes. A job no worker took within 1 ms (all busy) is built here. Caller holds P.lock.
-static void lib_wait(const VkPipeState *s, const GKey *k, Layout *l, double end) {
+static void lib_wait(const VkPipeState *s, const GKey *k, Layout *l, double end, int allow_steal) {
     ViKey vk_;
     PrKey pk;
     FsKey fk;
@@ -2365,7 +2365,7 @@ static void lib_wait(const VkPipeState *s, const GKey *k, Layout *l, double end)
             U.timeouts++;
             return;
         }
-        Lib *q = b[0]->job ? b[0] : b[1]->job ? b[1] : NULL;
+        Lib *q = allow_steal ? (b[0]->job ? b[0] : b[1]->job ? b[1] : NULL) : NULL;
         if (q && (now >= steal_at || !U.idle)) {
             U.stolen++;
             lib_steal(q);   // releases P.lock while building
@@ -2415,7 +2415,9 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
         uint64_t p0 = perf_begin(), t0 = qpc();
         if (build && U.on) {
             job_lower(p->job);   // its worker would only wait for the same libraries; it links them if this draw cannot
-            lib_wait(s, &k, (Layout *)p->lay, end);   // releases P.lock while waiting
+            // Only one-shot draws (wait_ms >= 1000) may steal a cold library onto the render thread; budgeted draws
+            // (geom 8 ms / full-screen 25 ms) must respect their deadline instead of stalling 60-90 ms in lib_steal.
+            lib_wait(s, &k, (Layout *)p->lay, end, wait_ms >= 1000);   // releases P.lock while waiting
             build = 0;                                // links here when both libraries exist (gpl_link build 0)
         } else if (build) {
             p->fast_tried = 1;   // the job, if a worker takes it meanwhile, goes straight to the optimised build
@@ -3544,8 +3546,10 @@ static void autosave_once(void) {
     if (total == last_n || busy) return;
     uint64_t diff = total - last_n;
     if (!menu_is_open()) {
-        if (elapsed < 300000) return;
-        if (diff < 32 && elapsed < 600000) return;
+        if (elapsed < 900000) return;
+        if (diff < 64 && elapsed < 1800000) return;
+    } else if (elapsed < 300000) {
+        return;
     }
     last_n = total, last_ms = now;
     cache_save(0);
