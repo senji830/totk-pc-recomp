@@ -4,9 +4,9 @@
 > **Patched Community Fork of [valentderah/totk-pc-recomp](https://github.com/valentderah/totk-pc-recomp)**
 >
 > - **Original Author & Upstream Repository:** Valiantsin Dzerakh ([@valentderah](https://github.com/valentderah)) — https://github.com/valentderah/totk-pc-recomp
-> - **Base Upstream Version & Commit:** `0.5.0` ([`afae80c908ab9fc9cdbafa9ed5295c946d80aa21`](https://github.com/valentderah/totk-pc-recomp/commit/afae80c908ab9fc9cdbafa9ed5295c946d80aa21))
+> - **Base Upstream Version & Commit:** `0.5.1` ([`889da4e7`](https://github.com/valentderah/totk-pc-recomp/commit/889da4e7))
 > - **Original License & Credits:** Preserved intact under the original [MIT License](LICENSE) (`Copyright (c) 2026 Valiantsin Dzerakh`) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) (crediting LAS Recomp, MacNativeGames, d2r-mobile, nxnative, SavageWindRecomp, Ryujinx, deko3d, hactool, RenoDX, SDL 3, Dear ImGui, AMD FidelityFX, VMA, libopus, libvpx, Zstandard, and all other upstream contributors).
-> - **Patches Included in This Fork:** See [PATCHES.md](PATCHES.md) for the 4 runtime bug fixes (ability scan-wave glitch `#1064`, Reflex + `frame_queue=1` swap pacing & FPS overlay accuracy, zero-overhead Shrine R32F floor flicker fix `#530`/`#1134`, and non-blocking pipeline cache autosave on non-Intel GPUs `#681`).
+> - **Patches Included in This Fork:** See [PATCHES.md](PATCHES.md) for all runtime bug fixes and smoothness improvements layered on top of upstream `0.5.1` (including `#1064`, `#530`/`#1134`, `#681`, `#938`, Reflex + `frame_queue=1`, `water_lod_fix`, `replay_workers=auto`, chunked-replay fixes, `fast_load`, pre-warmed `totk_xlate` children, and dedicated urgent GPL library workers).
 
 **TotK Recomp** is a static recompilation of *The Legend of Zelda: Tears of the Kingdom* (Nintendo Switch, 2023) into a native x86-64 application for Windows and Linux ([docs/architecture.md](docs/architecture.md)).
 
@@ -30,13 +30,21 @@ Report problems as issues, following [CONTRIBUTING.md](CONTRIBUTING.md).
 - Custom resolutions (1080p, 2k...), supersampling and AMD FSR 1 upscaling
 - NVIDIA DLSS / DLAA on RTX GPUs: the setup downloads `nvngx_dlss.dll` from NVIDIA's DLSS SDK repository
   (github.com/NVIDIA/DLSS, NVIDIA RTX SDK license) when it finds an RTX GPU; untick it in the setup to skip it
+- AMD FSR 3.1 on any GPU, and AMD FSR 4 on Windows on the Radeon GPUs AMD's FSR SDK libraries support, in the same
+  modes as DLSS: for FSR 4 the setup downloads AMD's signed FSR SDK libraries
+  (github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK, AMD FSR SDK license), ticked by default with an AMD GPU
 - HDR10 output with peak, game and HUD brightness settings
-- 16:10 (Steam Deck, handhelds), 3:2 (Surface, Framework), 21:9 and 32:9 (ultrawide) game resolutions, with the camera and the interface in that shape
+- Ultrawide monitors, 21:9 and 32:9 (2560x1080, 3440x1440, 3840x1600, 5120x2160, 3840x1080, 5120x1440, 7680x2160):
+  the camera sees the whole width, the map and the loading screen fill it without bars or stretching, and the HUD sits
+  at the screen's edges or in the middle 21:9 or 16:9 (`hud_width`)
+- Other screen shapes from 4:3 to 32:9, each with the camera and the interface in that shape: 16:10 (Steam Deck,
+  handhelds), 3:2 (Surface, Framework), 4:3 (iPads, CRT monitors) and phones (19.5:9, 20:9) for streaming; on shapes
+  narrower than 16:9 the view can keep the 16:9 width (`vert_plus`, off by default)
 - Anisotropic texture filtering up to 16x, for sharp ground into the distance
 - In-game settings menu (F1) and performance overlay (F10)
 - Play time across runs on the Game tab of the settings menu, kept in `playtime.txt` next to the saves
 - Discord Rich Presence ("Playing TotK Recomp" with the play time), off by default, own application id supported
-- Setup in 11 languages, in-game menu in 4 ([Languages](#languages))
+- Setup in 12 languages, in-game menu in 12 ([Languages](#languages))
 - Keyboard, mouse and gamepad with remapping, rumble and gyro
 - Stereo or 5.1 surround sound output
 - Xbox and PlayStation button prompts: Xbox's LB, RB, LT, RT, Menu, View and A, B, X, Y, or PlayStation's ○ × △ □, L1, R1, L2, R2, Options and Share, as labelled on the button to press, with either button layout
@@ -51,7 +59,7 @@ Report problems as issues, following [CONTRIBUTING.md](CONTRIBUTING.md).
 
 The game keeps the text and voices of every language it shipped with. The port's own setup and in-game menu (F1) come
 in these; both follow the Windows display language, and the menu has its own choice on its Menu tab. A Traditional
-Chinese Windows gets the Simplified Chinese setup.
+Chinese Windows gets the Simplified Chinese setup and menu.
 
 | Language | Setup | In-game menu |
 |---|:---:|:---:|
@@ -59,13 +67,14 @@ Chinese Windows gets the Simplified Chinese setup.
 | Русский | ✅ | ✅ |
 | Português (Brasil) | ✅ | ✅ |
 | 简体中文 | ✅ | ✅ |
-| Deutsch | ✅ | English |
-| Français | ✅ | English |
-| Español | ✅ | English |
-| Italiano | ✅ | English |
-| Nederlands | ✅ | English |
-| 日本語 | ✅ | English |
-| 한국어 | ✅ | English |
+| Deutsch | ✅ | ✅ |
+| Français | ✅ | ✅ |
+| Español | ✅ | ✅ |
+| Italiano | ✅ | ✅ |
+| Nederlands | ✅ | ✅ |
+| 日本語 | ✅ | ✅ |
+| 한국어 | ✅ | ✅ |
+| Tiếng Việt | ✅ | ✅ |
 
 Spotted a clumsy phrase, or want your language added? The setup texts are in `installer/text/<language>.json`, the
 menu texts in `runtime/ui_text.c`; open an issue or a pull request ([CONTRIBUTING.md](CONTRIBUTING.md)). Fixes from
@@ -79,13 +88,14 @@ native speakers are welcome.
 
 ### Windows
 
-Requirements: Windows 10 or later, an x86-64 CPU with SSE4.2 (AVX2/FMA machines get a faster build), a GPU with Vulkan 1.3 and `VK_EXT_external_memory_host`, about 36 GiB free during setup (20 GiB after).
+Requirements: Windows 10 or later, an x86-64 CPU with SSE4.2 (AVX2/FMA machines get a faster build), a GPU with Vulkan 1.3 (`VK_EXT_external_memory_host` recommended: without it the game copies its memory pools and runs slower), about 36 GiB free during setup (20 GiB after).
 
 1. Download `TotK-Setup-<version>-windows.zip` from [Releases](../../releases/latest) and unpack it.
 2. Start `TotK-Setup.exe`. If SmartScreen warns about an unsigned app, choose *More info*, then *Run anyway*.
 3. Pick your game files, the language and an install folder, and press *Start*. The setup builds the game once. With
    an NVIDIA RTX GPU it also downloads NVIDIA DLSS, unless you untick *Download NVIDIA DLSS*; turn DLSS on in the
-   menu (F1).
+   menu (F1). With *Download AMD FSR 4* ticked (the default with an AMD GPU) it downloads AMD's FSR SDK libraries;
+   in the menu, pick *AMD FSR 4* as the *3D scene upscaler*.
 4. Play `totk.exe` from the install folder.
 
 ### Linux

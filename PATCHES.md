@@ -1,11 +1,11 @@
-# Upstream Attribution & Patch Notes (`0.5.3+afae80c9`)
+# Upstream Attribution & Patch Notes (`0.5.4+889da4e7`)
 
 ## Original Source & Licensing
 
 All original TotK Recomp code, architecture, lifter, runtime, installer, and documentation belong to **Valiantsin Dzerakh** ([@valentderah](https://github.com/valentderah)) and upstream contributors:
 
 - **Original Repository:** https://github.com/valentderah/totk-pc-recomp
-- **Base Release / Commit:** `0.5.0` (`afae80c908ab9fc9cdbafa9ed5295c946d80aa21`)
+- **Base Release / Commit:** `0.5.1` (`889da4e7`, synced from upstream `0.5.1` release)
 - **License:** [MIT License](LICENSE) — `Copyright (c) 2026 Valiantsin Dzerakh` (preserved unmodified)
 - **Third-Party Code & Bundled Toolchain Licenses:** Preserved unmodified in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and the release `licenses/` directory, including:
   - [LAS Recomp](https://github.com/peiikai/LASRecomp) (MIT)
@@ -22,7 +22,7 @@ All original TotK Recomp code, architecture, lifter, runtime, installer, and doc
 
 ---
 
-## Patches Applied on Top of `afae80c9`
+## Patches Applied on Top of Upstream `0.5.1` (`889da4e7`)
 
 ### 1. Ability Scan-Wave 1-Frame Rainbow/Magenta & HDR Bloom Glitch (upstream `#1064`)
 - **Files:** `runtime/vk_texture.c`, `runtime/vk_memory.c`
@@ -118,6 +118,16 @@ All original TotK Recomp code, architecture, lifter, runtime, installer, and doc
   - **Default `replay_workers = auto`:** Scale chunked replay workers automatically by logical CPU count (`4` on `>= 12` threads, `2` on `8–11`, `0` on `< 8` so 4-core CPUs do not contend with game threads).
   - **Eliminate pipeline wait budget overruns & heavy autosave spikes:** Disallow `lib_steal()` on budgeted draws (`wait_ms < 1000`, restricting stealing to `one-shot` draws only so cold 60–90 ms shaders never blow past the 8 ms / 25 ms budget) and lengthen heavy pipeline cache autosaves to 15 min (`>= 64` new pipelines, 30 min fallback, 5 min in menu).
   - **Fast Loading (`fast_load = 1`, default on, 1.4.3 with `realtime = 1`):** Temporarily raise the pacer cap to `120 fps` strictly while `LoadingFade_00` (fast travel, shrine entry/exit, save loads) or `EventFade_00` (pre/post-cutscene black fades) is open, then snap the 5-frame step average cleanly back to `fps_limit` on exit.
+
+### 13. Upstream `0.5.1` (`889da4e7`) Sync + Smooth New-Shader & Ultrahand Handling (`0.5.4`)
+- **Files:** Upstream `0.5.1` merge (`889da4e7`) + `runtime/gfx_shader.c`, `runtime/vk_exec_draw.c`, `runtime/vk_pipeline.c`, `runtime/cfg.c`
+- **Upstream `0.5.1` Highlights Included:**
+  - Queued `nvnMemoryPoolFinalize` and `nvnTextureWriteTexels` under `replay_async = 1` (`#88`, eliminating multi-second streaming drains during map transitions like Depths -> Korok Forest Ascend).
+  - `sync_ahead = 1`, `barrier_merge = 1`, and `host_checkpoint = 1` on by default; DRS timestamp wrap fix (`#1123`); merged overlapping mirror uploads (`#1509`); FSR 3.1/4 tonemap & Frame Gen scope fixes (`#1409`, `#1495`); AMD FSR 4 & Anti-Lag 2; boot loading window with hearts (`#1331`); 4:3–32:9 UI layouts; 12 menu languages; `mod_layout`, `restbl_cache`, and full mod plugin code/fs support; 1.4.3/1.1.0 thunderstorm lightning fix (`#1287`).
+- **New Fork Improvements in `0.5.4`:**
+  - **Pre-warm all runtime shader translator children (`e7f32d4`):** `svc_warm_worker()` pre-warms all `svc_runtime_limit()` (`2/2`) `totk_xlate.exe --serve` processes in the background after boot, eliminating the ~900 ms cold-start stall on multi-shader `one-shot` draws (e.g., Ultrahand object attachment `84x84` Autobuild thumbnail).
+  - **Atomic claim-and-refund pipeline wait budget across `replay_workers` (`9cc9c0f`):** Atomically claim the frame's wait budget before entering `vk_pipeline` and refund unused time after completion so parallel `replay_workers` cannot multiply per-frame wait caps, with a tighter `4 ms` default `geom` cap.
+  - **Dedicated urgent GPL library workers & non-stalling full-screen cap (`157dfea`):** Spawn 2 dedicated `lib_worker` threads exclusively for `U.head` urgent GPL libraries (never starved by `A.low`/`A.head` monolithic builds), pause starting new `A.low` monolithic builds while `U.running > 0`, lower default `full-screen` wait budget in `any` mode from `25 ms` to `12 ms`, and mark timed-out pipelines (`wait_timed_out`) so consecutive frames do not re-stall.
 
 ---
 
