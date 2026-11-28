@@ -3757,7 +3757,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     int full = count <= 6 && (uint64_t)sc.extent.width * sc.extent.height * 2 >= (uint64_t)ex->pass_w * ex->pass_h;
     int gpl_only = 0;
     uint32_t wait_ms = 0;
-    uint64_t t0 = 0;
+    uint64_t t0 = 0, wait_f = 0;
     if (oneshot > 0) {
         wait_ms = ONESHOT_WAIT_MS;
     } else if (skip == 0 || (skip < 2 && (full || vk_caps.gpl))) {
@@ -3769,14 +3769,14 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
             if (ms > 200) ms = 200;
             budget_ns = (int64_t)ms * 1000000LL;
             const char *ge = cfg_get("TOTK_PIPE_GEOM_WAIT_MS");
-            int gms = ge && *ge ? atoi(ge) : 8;
+            int gms = ge && *ge ? atoi(ge) : 4;
             if (gms < 0) gms = 0;
             if (gms > 50) gms = 50;
             geom_budget_ns = (int64_t)gms * 1000000LL;
         }
-        uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+        wait_f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
         uint64_t prev = __atomic_load_n(&g_wait_frame, __ATOMIC_RELAXED);
-        if (f != prev && __atomic_compare_exchange_n(&g_wait_frame, &prev, f, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        if (wait_f != prev && __atomic_compare_exchange_n(&g_wait_frame, &prev, wait_f, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
             __atomic_store_n(&g_wait_left_ns, budget_ns, __ATOMIC_RELEASE);
             __atomic_store_n(&g_geom_left_ns, geom_budget_ns, __ATOMIC_RELEASE);
         }
@@ -3808,21 +3808,25 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         if (pc) D->PM.valid = 1, MX_CPY(&D->PM.s, &s, sizeof s), D->PM.info = info, D->B.st_pm = 0;
         D->PM.gen = pgen;   // s equals PM.s: built from pipe as it is now
     } else {
-        if (wait_ms && oneshot <= 0) t0 = kern_now_ns();
+        int64_t claimed_ns = 0;
+        int64_t *bucket = NULL;
+        if (wait_ms && oneshot <= 0) {
+            // Atomically claim the frame's remaining wait budget before entering vk_pipeline so parallel
+            // replay_workers cannot multiply the per-frame budget; unused time is refunded after the call.
+            bucket = gpl_only ? &g_geom_left_ns : &g_wait_left_ns;
+            claimed_ns = __atomic_exchange_n(bucket, 0, __ATOMIC_ACQ_REL);
+            wait_ms = claimed_ns >= 1000000 ? (uint32_t)(claimed_ns / 1000000) : 0;
+            if (wait_ms) t0 = kern_now_ns();
+            else if (claimed_ns > 0) __atomic_add_fetch(bucket, claimed_ns, __ATOMIC_RELEASE), claimed_ns = 0;
+        }
         w0 = t0 ? t0 : wait_ms ? kern_now_ns() : 0;   // the clock is read only for draws that may wait
         p = gpl_only ? vk_pipeline_graphics_gpl_async(&s, &info, &pending, wait_ms)
                      : vk_pipeline_graphics_async(&s, &info, &pending, wait_ms);
         if (t0) {
             int64_t spent = (int64_t)(kern_now_ns() - t0);
-            if (spent >= 50000) {
-                int64_t *bucket = gpl_only ? &g_geom_left_ns : &g_wait_left_ns;
-                int64_t cur = __atomic_load_n(bucket, __ATOMIC_RELAXED);
-                while (cur > 0) {
-                    int64_t nxt = spent < cur ? cur - spent : 0;
-                    if (__atomic_compare_exchange_n(bucket, &cur, nxt, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
-                        break;
-                }
-            }
+            int64_t refund = claimed_ns - (spent >= 50000 ? spent : 0);
+            if (refund > 0 && __atomic_load_n(&g_wait_frame, __ATOMIC_RELAXED) == wait_f)
+                __atomic_add_fetch(bucket, refund, __ATOMIC_RELEASE);
         }
         why = oneshot > 0 ? "one-shot, shader" : wait_ms ? (gpl_only ? "geom" : full ? "full-screen" : "draw") : NULL;
         if (pending && oneshot < 0 && !vk_exec_targets_recent(ex, skip >= 1)) {
