@@ -1782,9 +1782,11 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view, uint32_t pos) 
                 best = p, best_tier = tier;
         }
         e = best ? best : own;
-    } else if (e->next_at || nvn_hm_get(&by_addr, &k.addr) != e) {
-        // Even when e is live in by_key, another live same-format, same-geometry descriptor at the same storage (e.g.
-        // an RGBA8 UI render target aliased by an (A,A,A,A) sampler descriptor) may hold a newer GPU render.
+    } else if (!e->wr_seq && (e->next_at || nvn_hm_get(&by_addr, &k.addr) != e)) {
+        // When e is a live sampler-only descriptor in by_key (never GPU-written itself, e.g. an (A,A,A,A) UI sampler
+        // view), follow a live same-format, same-geometry GPU render target at the same storage. Never redirect a live
+        // render target (e->wr_seq != 0): under replay_workers > 0, chunks record out of order and redirecting between
+        // two active render targets at the same address causes frame-to-frame flicker.
         Tex *best = e;
         for (Tex *p = nvn_hm_get(&by_addr, &k.addr); p; p = p->next_at) {
             if (p == e || !live_at(p, pos) || linear_format(p->key.d.format) != linear_format(k.d.format)) continue;
