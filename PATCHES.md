@@ -1,4 +1,4 @@
-# Upstream Attribution & Patch Notes (`0.5.2+afae80c9`)
+# Upstream Attribution & Patch Notes (`0.5.3+afae80c9`)
 
 ## Original Source & Licensing
 
@@ -109,6 +109,15 @@ All original TotK Recomp code, architecture, lifter, runtime, installer, and doc
   - Track `cache_copying` around `vkGetPipelineCacheData()` in `cache_save()` so non-oneshot draws skip waiting (`wait_ms = 0`) instead of stalling ~200 ms on NVIDIA's internal `VkPipelineCache` lock during a 700+ MB cache copy.
   - Prefer running background `autosave_once()` when the overlay menu is open (`>= 60 s`) or during quiet gameplay (`>= 5 min` with `>= 32` new pipelines, `10 min` fallback, and no urgent pipeline builds in flight).
   - Give 3D geometry draws (`!full`) under `pipe_skip = any` a small shared per-frame GPL-only wait budget (`TOTK_PIPE_GEOM_WAIT_MS`, default `8 ms`) so new cutscene characters build their `~1 ms` stage libraries and render on frame 1 instead of popping in late, while still never blocking on monolithic compiles.
+
+### 12. Texture Alias Freshness, Zero-Stall Pipeline Budget, Auto Replay Workers & Fast Loading (`0.5.3`)
+- **Files:** `runtime/vk_texture.c`, `runtime/vk_pipeline.c`, `runtime/vk_exec.c`, `runtime/frame_rate.c`, `runtime/cfg.c`, `runtime/ui/menu.cpp`, `totk.ini.example`
+- **Fix:**
+  - **Texture alias freshness (`#938`):** Track monotonic GPU write sequence (`wr_seq`) and prioritize freshest matching same-format entries in `slot_resolve()` / `alias_copy()`.
+  - **Chunked replay visual bug fixes (`replay_workers > 0`):** Make `wr_seq` chunk-order-aware (`wr_epoch`, `wr_pos`, `prev_wr_seq`, `wr_after()`) and restrict live-entry redirects in `slot_resolve()` to sampler-only descriptors (`!e->wr_seq`), fixing title-screen floating green particle flicker and sun flicker under multi-worker replay.
+  - **Default `replay_workers = auto`:** Scale chunked replay workers automatically by logical CPU count (`4` on `>= 12` threads, `2` on `8–11`, `0` on `< 8` so 4-core CPUs do not contend with game threads).
+  - **Eliminate pipeline wait budget overruns & heavy autosave spikes:** Disallow `lib_steal()` on budgeted draws (`wait_ms < 1000`, restricting stealing to `one-shot` draws only so cold 60–90 ms shaders never blow past the 8 ms / 25 ms budget) and lengthen heavy pipeline cache autosaves to 15 min (`>= 64` new pipelines, 30 min fallback, 5 min in menu).
+  - **Fast Loading (`fast_load = 1`, default on, 1.4.3 with `realtime = 1`):** Temporarily raise the pacer cap to `120 fps` strictly while `LoadingFade_00` (fast travel, shrine entry/exit, save loads) or `EventFade_00` (pre/post-cutscene black fades) is open, then snap the 5-frame step average cleanly back to `fps_limit` on exit.
 
 ---
 
