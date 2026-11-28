@@ -1732,8 +1732,16 @@ void vk_exec_contexts(void (*fn)(VkExec *ex)) {
 
 static int chunked_on(void) {
     if (SC.workers < 0) {
-        SC.workers = cfg_int("TOTK_REPLAY_WORKERS");
+        const char *rw = cfg_value("TOTK_REPLAY_WORKERS");
+        if (!rw || !*rw || !strcasecmp(rw, "auto")) {
+            int cpus = plat_cpu_count();
+            SC.workers = cpus >= 12 ? 4 : cpus >= 8 ? 2 : 0;
+            rt_log("vk: replay_workers=auto -> %d (%d logical CPUs)", SC.workers, cpus);
+        } else {
+            SC.workers = atoi(rw);
+        }
         if (SC.workers < 0) SC.workers = 0;
+        if (SC.workers > MAX_RECS) SC.workers = MAX_RECS;
         SC.chunks = cfg_int("TOTK_REPLAY_CHUNKS");
         if (SC.chunks <= 0) SC.chunks = 2 * SC.workers;
         SC.min_draws = cfg_int("TOTK_REPLAY_CHUNK_DRAWS");

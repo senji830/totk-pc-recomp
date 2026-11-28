@@ -1201,11 +1201,12 @@ static void row_threads(const char *key, UiTextId label, UiTextId desc) {
 // The chunked replay's recording threads: Off, then the counts; the note under the value is what this run uses, which
 // a change replaces only after a restart.
 static void row_replay_workers(void) {
-    static const char *const vals[] = {"0", "2", "3", "4", "6", "8", "12", "16"};
+    static const char *const vals[] = {"auto", "0", "2", "3", "4", "6", "8", "12", "16"};
     enum { N = sizeof vals / sizeof *vals };
     const char *names[N];
-    names[0] = menu_text(UI_MENU_OFF);
-    for (int i = 1; i < N; i++) names[i] = vals[i];
+    names[0] = menu_text(UI_MENU_AUTO);
+    names[1] = menu_text(UI_MENU_OFF);
+    for (int i = 2; i < N; i++) names[i] = vals[i];
     static char now[64];
     char n[16];
     int w = vk_exec_replay_workers();
