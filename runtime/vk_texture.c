@@ -59,7 +59,8 @@ typedef struct Tex {
     uint8_t run;                  // frames in a row up to run_frame with a GPU write, counted up to WB_RUN
     uint64_t wr_fence;            // any entry: newest submission recorded to write its image (render, copy, clear,
                                   // storage binding); ReadTexels waits for it instead of draining the replay queue
-    uint64_t wr_seq;              // monotonic GPU write order across all entries (vk_texture_gpu_written)
+    uint64_t wr_seq, prev_wr_seq; // monotonic GPU write order (newest, and before current submit_epoch)
+    uint32_t wr_epoch, wr_pos;    // chunked replay: submit_epoch and earliest op pos of a write in that submission
     uint8_t listed;               // in owned[]
     uint8_t eager_cand;           // in eager_c[]: rendered by the value being recorded, snapshot not taken yet
     struct EagerSnap *eager;      // wb_eager: the staging copy of the image that value eager->value ended with
@@ -1422,6 +1423,21 @@ static int alias_candidate(const TexKey *k, const tex_t *t, uint32_t pos) {
     return 0;
 }
 
+static int wr_after(const Tex *a, const Tex *b, uint32_t pos) {
+    if (pos == UINT32_MAX) return a->wr_seq > b->wr_seq;
+    int ac = a->wr_epoch == submit_epoch && a->wr_pos <= pos;
+    int bc = b->wr_epoch == submit_epoch && b->wr_pos <= pos;
+    if (ac != bc) return ac;
+    if (ac) return a->wr_pos > b->wr_pos;
+    uint64_t as = a->wr_epoch == submit_epoch ? a->prev_wr_seq : a->wr_seq;
+    uint64_t bs = b->wr_epoch == submit_epoch ? b->prev_wr_seq : b->wr_seq;
+    return as > bs;
+}
+
+static int wr_equal(const Tex *a, const Tex *b, uint32_t pos) {
+    return !wr_after(a, b, pos) && !wr_after(b, a, pos);
+}
+
 static Tex *entry_of(const tex_t *t) {
     TexKey k;
     make_key(t, &k);
@@ -1468,14 +1484,15 @@ static Tex *entry_of(const tex_t *t) {
             if (tex_alias && alias_compatible(e, p) && alias_has_gpu_content(p, pos)) {
                 int p_swz = same_but_swizzle(&p->key, &k);
                 int s_swz = src ? same_but_swizzle(&src->key, &k) : 0;
-                if (!src || (p_swz && !s_swz) || (p_swz == s_swz && p->wr_seq > src->wr_seq)) src = p;
+                if (!src || (p_swz && !s_swz) || (p_swz == s_swz && wr_after(p, src, pos))) src = p;
             }
         }
         if (alias) perf_count(PERF_CNT_TEX_ALIAS);
         if (tex_alias) {
             if (src && alias_copy(e, src)) {
                 n_alias_copied++;
-                e->wr_seq = src->wr_seq;
+                e->wr_seq = src->wr_epoch == submit_epoch && pos != UINT32_MAX && src->wr_pos > pos ? src->prev_wr_seq : src->wr_seq;
+                e->prev_wr_seq = e->wr_seq;
                 if (e->pub.mirrored) {   // the content is src's GPU render, newer than the storage bytes
                     vk_mem_changed(e->pub.addr, e->t.L.size, 0, &e->wgen);
                     e->uploaded = 1;
@@ -1626,17 +1643,30 @@ void vk_texture_gpu_written(const tex_t *t) {
     Tex *e = entry_of(t);
     if (e) {
         make_fresh(e);   // a partial render keeps what the storage held before
+        uint32_t pos = vk_exec_replay_pos();
         if (!e->pub.gpu_owned) {   // entry_of's alias choice of a chunk at an earlier op leaves this render out
-            uint32_t pos = vk_exec_replay_pos();
             e->own_epoch = pos == UINT32_MAX ? 0 : submit_epoch, e->own_pos = pos;
         }
         e->pub.gpu_owned = 1;
         uint64_t f = vk_exec_recording_fence();
         if (f > e->wr_fence) e->wr_fence = f;
-        e->wr_seq = ++wr_counter;
+        if (pos == UINT32_MAX) {
+            e->wr_seq = ++wr_counter;
+            e->prev_wr_seq = e->wr_seq;
+            e->wr_epoch = 0, e->wr_pos = 0;
+        } else {
+            if (e->wr_epoch != submit_epoch) {
+                e->prev_wr_seq = e->wr_seq;
+                e->wr_epoch = submit_epoch;
+                e->wr_pos = pos;
+            } else if (pos < e->wr_pos) {
+                e->wr_pos = pos;
+            }
+            e->wr_seq = ++wr_counter;
+        }
         // If another descriptor shares this storage address (e.g. a live (A,A,A,A) sampler view over an RGBA8 UI
         // render target), invalidate slot caches for this address so sampling follows this fresher GPU render.
-        if (e->next_at || nvn_hm_get(&by_addr, &e->key.addr) != e) tex_gen_bump(e->key.addr);
+        if (pos == UINT32_MAX && (e->next_at || nvn_hm_get(&by_addr, &e->key.addr) != e)) tex_gen_bump(e->key.addr);
         if (e->pub.mirrored) {
             e->gpu_dirty = 1;
             storage_rewritten(e, 0, &e->gpu_gen);   // CPU writes up to here are older than this render
@@ -1748,7 +1778,7 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view, uint32_t pos) 
                      : same_geo && p->key.d.levels == k.d.levels ? 2
                      : same_geo ? 1 : 0;
             if (!best || tier > best_tier ||
-                (tier == best_tier && (p->wr_seq > best->wr_seq || (p->wr_seq == best->wr_seq && p->use_seq > best->use_seq))))
+                (tier == best_tier && (wr_after(p, best, pos) || (wr_equal(p, best, pos) && p->use_seq > best->use_seq))))
                 best = p, best_tier = tier;
         }
         e = best ? best : own;
@@ -1761,7 +1791,7 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view, uint32_t pos) 
             if (p->key.d.target != k.d.target || p->key.d.width != k.d.width ||
                 p->key.d.height != k.d.height || p->key.d.depth != k.d.depth)
                 continue;
-            if (p->wr_seq > best->wr_seq && alias_has_gpu_content(p, pos)) best = p;
+            if (wr_after(p, best, pos) && alias_has_gpu_content(p, pos)) best = p;
         }
         e = best;
     }
