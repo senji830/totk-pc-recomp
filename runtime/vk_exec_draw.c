@@ -3764,7 +3764,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         static int64_t budget_ns = -1, geom_budget_ns = -1;
         if (budget_ns < 0) {
             const char *we = cfg_get("TOTK_PIPE_WAIT_MS");
-            int ms = we && *we ? atoi(we) : (skip == 0 ? 80 : 25);
+            int ms = we && *we ? atoi(we) : (skip == 0 ? 80 : 12);
             if (ms < 0) ms = 0;
             if (ms > 200) ms = 200;
             budget_ns = (int64_t)ms * 1000000LL;

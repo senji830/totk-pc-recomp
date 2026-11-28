@@ -136,6 +136,7 @@ typedef struct Pipe {
     const struct Layout *lay;          // graphics: the layout it was entered with
     VkPipeline fast;                   // GPL: the fast-linked pipeline (kept until shutdown: recorded draws use it)
     uint8_t fast_tried;
+    uint8_t wait_timed_out;            // a budgeted draw already timed out waiting for p; do not re-stall next frame
     size_t key_size;
     uint8_t key[];
 } Pipe;
@@ -1731,11 +1732,14 @@ static VkPipeline lib_put(uint64_t h, const void *key, uint32_t size, VkPipeline
 // Shader libraries a waiting draw needs (lib_wait): queued here ahead of every pipeline job, so an idle worker builds
 // each at once and the vertex and fragment libraries of one draw build in parallel. A job no worker took is built by
 // the first thread that needs its library (lib_get, lib_wait). Under P.lock.
+#define MAX_LIB_WORKERS 2
 typedef struct LibJob { struct LibJob *next; Lib *b; int kind; Layout *l; VkPipeState s; GKey k; } LibJob;
 static struct {
     LibJob *head, *tail;
     int idle;                          // workers asleep on work_cv
     int running;                       // jobs workers are building
+    int threads;                       // dedicated urgent GPL library workers (never blocked by monolithic builds)
+    PlatThread *thread[MAX_LIB_WORKERS];
     int on;                            // TOTK_PIPE_WAIT: 1 workers (default), 0 the drawing thread builds them (draw);
                                        // set by vk_pipeline_async_enable, before the replay runs
     uint64_t waits, queued, by_worker, stolen, timeouts;
@@ -2096,13 +2100,36 @@ static void prebuild_report(void) {
            "ready", K.built, K.failed, K.promoted, now_ms() - K.t0);
 }
 
+// Dedicated urgent GPL stage-library worker: never takes monolithic A.low/A.head jobs, so a waiting draw's VS + FS
+// stage libraries start in parallel immediately even while all A workers are busy with optimised monolithic compiles.
+static void lib_worker(void *arg) {
+    (void)arg;
+    plat_mutex_lock(&P.lock);
+    for (;;) {
+        while (!U.head) {
+            U.idle++;
+            plat_cond_wait(&work_cv, &P.lock);
+            U.idle--;
+        }
+        LibJob *lj = U.head;
+        if (!(U.head = lj->next)) U.tail = NULL;
+        lj->b->job = NULL;
+        U.by_worker++, U.running++;
+        lib_build(lj->b, lj->kind, &lj->s, &lj->k, lj->l);   // releases P.lock while building
+        U.running--;
+        if (!U.running && !U.head && A.low) plat_cond_broadcast(&work_cv);
+        free(lj);
+    }
+}
+
 static void pipe_worker(void *arg) {
     int me = (int)(intptr_t)arg;
     plat_mutex_lock(&P.lock);
     for (;;) {
         // With 3 or more workers one never takes low-queue work, so a waiting draw's library starts at once
-        // (not with TOTK_PIPE_WAIT=draw).
-        while (!U.head && !A.head && !(A.low && (A.threads < 3 || !U.on || A.low_running < A.threads - 1))) {
+        // (not with TOTK_PIPE_WAIT=draw). Also pause starting new low-queue monolithic builds while urgent U jobs
+        // are actively compiling so they do not contend on the driver's pipeline cache lock during shader bursts.
+        while (!U.head && !A.head && !(A.low && !U.running && (A.threads < 3 || !U.on || A.low_running < A.threads - 1))) {
             U.idle++;
             plat_cond_wait(&work_cv, &P.lock);
             U.idle--;
@@ -2115,6 +2142,7 @@ static void pipe_worker(void *arg) {
             U.by_worker++, U.running++;
             lib_build(lj->b, lj->kind, &lj->s, &lj->k, lj->l);   // releases P.lock while building
             U.running--;
+            if (!U.running && !U.head && A.low) plat_cond_broadcast(&work_cv);
             free(lj);
             continue;
         }
@@ -2193,7 +2221,16 @@ static int workers_start(void) {
         if (!t) break;
         A.thread[A.threads++] = t;   // kept: promote() raises a worker running a prebuild job
     }
-    if (A.threads) rt_log("vk_pipeline: %d background graphics pipeline workers", A.threads);
+    if (A.threads && U.on && P.gpl && !U.threads) {
+        int un = cpus >= 4 ? MAX_LIB_WORKERS : 1;
+        for (int i = 0; i < un; i++) {
+            PlatThread *t = plat_thread_new(lib_worker, NULL, "pipe lib worker");
+            if (!t) break;
+            U.thread[U.threads++] = t;
+        }
+    }
+    if (A.threads) rt_log("vk_pipeline: %d background graphics pipeline workers (+%d urgent GPL library workers)",
+                          A.threads, U.threads);
     else rt_log("vk_pipeline: cannot start pipeline workers; building synchronously");
     return A.threads != 0;
 }
@@ -2408,7 +2445,10 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
     }
     // While background cache_save copies P.cache (e.g. 700+ MB on NVIDIA), the driver holds an internal lock on
     // P.cache for ~200 ms. Non-oneshot draws skip waiting rather than stalling the render thread on that lock.
-    if (wait_ms && wait_ms < 1000 && __atomic_load_n(&cache_copying, __ATOMIC_ACQUIRE)) wait_ms = 0;
+    // Likewise, if a budgeted draw already timed out waiting for p on a prior frame, let the worker finish without
+    // stalling consecutive frames.
+    if (wait_ms && wait_ms < 1000 && (__atomic_load_n(&cache_copying, __ATOMIC_ACQUIRE) || (p && p->wait_timed_out)))
+        wait_ms = 0;
     double end = (p && p->building && wait_ms) ? now_ms() + wait_ms : 0;
     if (p && p->building && P.gpl && !p->info.pipeline && !p->fast_tried && p->lay && p->lay->set1 && !k.fbl) {
         int final = 0, build = wait_ms != 0 && draw_build;
@@ -2451,6 +2491,7 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
         if (mwait && !p->building) perf_count(PERF_CNT_PIPE_WAIT);
     }
     int wait = p && p->building && !p->info.pipeline;
+    if (wait && wait_ms && wait_ms < 1000 && end && now_ms() >= end) p->wait_timed_out = 1;
     if (wait) P.stats.pending_skips++;
     VkPipeline pipe = p ? p->info.pipeline : VK_NULL_HANDLE;
     plat_mutex_unlock(&P.lock);
