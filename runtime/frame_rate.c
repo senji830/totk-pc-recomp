@@ -52,6 +52,7 @@
 #include "cfg.h"
 #include "gfx.h"
 #include "host.h"
+#include "input.h"
 #include "layout.h"
 #include "platform/platform.h"
 
@@ -117,10 +118,17 @@ int frame_step_realtime(void) { return step_word != NULL; }
 // follows the game's interval, so the limit stops at 60.
 #define LIMIT_MIN_HZ 30
 #define LIMIT_MAX_HZ 240   // 1 / STEP_MIN_S
+#define FAST_LOAD_HZ 120   // half of LIMIT_MAX_HZ: well above Havok's 1/240 s floor
 static int fps60_set = -2;
 static unsigned limit_seen;
 static int limit_read;
 static int limit_hz = -1;   // 0: display; -1 before the first read
+static int fast_load_active;
+
+static int fast_load_now(void) {
+    if (!RT_V143 || !step_word || !cfg_bool("TOTK_FAST_LOAD")) return 0;
+    return menu_ui_open("LoadingFade_00") || menu_ui_open("EventFade_00");
+}
 
 static int limit_parse(void) {
     const char *e = cfg_get("TOTK_FPS_LIMIT"), *old = cfg_get("TOTK_FPS60");
@@ -165,6 +173,12 @@ uint64_t frame_step_cap_ns(void) {
     // while the last frame went out with a generated picture: a menu or a fade, which has none, keeps the whole limit.
     // The real-time step follows the game's presents (frame_step_present), so it is the drawn frames' interval.
     if (gfx_frame_gen_live()) hz = hz / 2 < LIMIT_MIN_HZ ? LIMIT_MIN_HZ : hz / 2;
+    int fl = fast_load_now();
+    if (fl != fast_load_active) {
+        fast_load_active = fl;
+        sample_count = sample_next = 0;   // snap the 5-frame step average cleanly across the rate change
+    }
+    if (fl && hz < FAST_LOAD_HZ) hz = FAST_LOAD_HZ;
     return (uint64_t)(1e9 / hz + 0.5);
 }
 
