@@ -1558,16 +1558,23 @@ static void svc_warm_worker(void *arg) {
     plat_mutex_lock(&X.lock);
     xlate_workers_start_locked();
     plat_mutex_unlock(&X.lock);
-    Svc *v = svc_get();
-    if (!v->child) {
-        uint64_t t0 = plat_now_ms();
-        if (child_start(v)) {
-            char reply[LINE_MAX_LEN];
-            if (!child_exchange_raw(v, "{}", reply, sizeof reply)) child_stop(v);
-            else rt_log("gfx_shader: translator child ready in %llu ms", (unsigned long long)(plat_now_ms() - t0));
+    Svc *held[MAX_SVC];
+    int n = svc_runtime_limit();
+    if (n > MAX_SVC) n = MAX_SVC;
+    for (int i = 0; i < n; i++) held[i] = svc_get();
+    for (int i = 0; i < n; i++) {
+        Svc *v = held[i];
+        if (!v->child) {
+            uint64_t t0 = plat_now_ms();
+            if (child_start(v)) {
+                char reply[LINE_MAX_LEN];
+                if (!child_exchange_raw(v, "{}", reply, sizeof reply)) child_stop(v);
+                else rt_log("gfx_shader: translator child %d/%d ready in %llu ms", i + 1, n,
+                            (unsigned long long)(plat_now_ms() - t0));
+            }
         }
+        svc_put(v);
     }
-    svc_put(v);
 }
 
 void gfx_shader_warm_svc(void) {
