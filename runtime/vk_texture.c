@@ -698,9 +698,11 @@ static void sweep_released(void) {
 #define PRESSURE_STEP 32
 #define CLEAN_AGE_MS 5000u
 #define DEAD_AGE_MS 30000u
+#define DEAD_AGE_TIGHT_MS 10000u
+#define CLEAN_AGE_TIGHT_MS 3000u
 #define DEAD_QUIET_SUBMITS 600u
 #define DEAD_RETRY_QUERIES 8   // budget queries to skip after a search that found nothing
-static int vram_pressure = -1;
+static int vram_pressure = -1, tight_vram;
 static uint64_t released_cap;
 static uint64_t n_pressure_drops, n_pressure_overwritten;
 
@@ -760,14 +762,15 @@ static uint64_t pressure_search_ns;   // longest search since the last mem: rele
 static uint64_t drop_overwritten(uint64_t need, int *dropped, int step) {
     static int rest;
     int urgent = step > PRESSURE_STEP;
+    uint64_t dead_age = tight_vram ? DEAD_AGE_TIGHT_MS : DEAD_AGE_MS;
     if (rest > 0 && !urgent) { rest--; return 0; }
-    if (!rel_head || coarse_ms - rel_head->rel_ms < DEAD_AGE_MS) return 0;
+    if (!rel_head || coarse_ms - rel_head->rel_ms < dead_age) return 0;
     uint64_t t0 = plat_now_ns(), freed = 0;
     AddrIndex x;
     if (!addr_index(&x)) return 0;
     Tex *cand[OOM_STEP];
     int nc = 0;
-    for (Tex *e = rel_head; e && nc < step && coarse_ms - e->rel_ms >= DEAD_AGE_MS; e = e->rel_next) {
+    for (Tex *e = rel_head; e && nc < step && coarse_ms - e->rel_ms >= dead_age; e = e->rel_next) {
         if (!dead_candidate(e)) continue;
         int lo = 0, hi = x.n;   // the first entry at e's address, then e among those
         while (lo < hi) {
@@ -793,7 +796,8 @@ static uint64_t drop_overwritten(uint64_t need, int *dropped, int step) {
 
 // Clean released entries, oldest first: mirrored ones the GPU never wrote, which come back from their storage.
 static uint64_t drop_clean(uint64_t need, uint64_t freed, int *dropped, int step) {
-    for (Tex *e = rel_head, *next; e && freed < need && *dropped < step && coarse_ms - e->rel_ms >= CLEAN_AGE_MS; e = next) {
+    uint64_t clean_age = tight_vram && step > PRESSURE_STEP ? CLEAN_AGE_TIGHT_MS : CLEAN_AGE_MS;
+    for (Tex *e = rel_head, *next; e && freed < need && *dropped < step && coarse_ms - e->rel_ms >= clean_age; e = next) {
         next = e->rel_next;
         if (!e->pub.mirrored || e->pub.gpu_owned || e->gpu_dirty) continue;
         freed += own_bytes(e);
@@ -806,11 +810,14 @@ static uint64_t drop_clean(uint64_t need, uint64_t freed, int *dropped, int step
 
 static void sweep_pressure(void) {   // tex_lock held
     if (vram_pressure < 0) {
+        uint64_t u0, b0;
+        int ex0;
+        tight_vram = vk_mem_vram(&u0, &b0, &ex0) && b0 <= (6ull << 30);
         const char *s = cfg_get("TOTK_TEX_VRAM_PRESSURE");
-        vram_pressure = s && *s ? atoi(s) : 90;
-        if (vram_pressure < 0 || vram_pressure > 100) vram_pressure = 90;
+        vram_pressure = s && *s ? atoi(s) : (tight_vram ? 78 : 90);
+        if (vram_pressure < 0 || vram_pressure > 100) vram_pressure = tight_vram ? 78 : 90;
         const char *m = cfg_get("TOTK_TEX_RELEASED_MIB");
-        released_cap = (m && *m ? strtoull(m, NULL, 10) : 256) << 20;
+        released_cap = (m && *m ? strtoull(m, NULL, 10) : (tight_vram ? 96ull : 256ull)) << 20;
         rt_log("vk: released textures under VRAM pressure: %s%d%%; above %llu MiB of them: %s (TOTK_TEX_RELEASED_MIB)",
                vram_pressure ? "dropped above " : "off", vram_pressure, (unsigned long long)(released_cap >> 20),
                released_cap ? "dropped" : "no cap");
@@ -824,9 +831,10 @@ static void sweep_pressure(void) {   // tex_lock held
         if (used > line && used - line > need) need = used - line;
     }
     if (!need) return;
+    int step = tight_vram && need > (64ull << 20) ? 64 : PRESSURE_STEP;
     int dropped = 0;
-    uint64_t freed = drop_overwritten(need, &dropped, PRESSURE_STEP);
-    drop_clean(need, freed, &dropped, PRESSURE_STEP);
+    uint64_t freed = drop_overwritten(need, &dropped, step);
+    drop_clean(need, freed, &dropped, step);
 }
 
 // rt_oom_request (an allocation failed somewhere, oom.c): the same two kinds as sweep_pressure, as many as OOM_STEP

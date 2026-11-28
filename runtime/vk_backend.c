@@ -693,10 +693,10 @@ static void vk_be_program_release(const prog_t *p) {
         uint64_t used = p ? __atomic_load_n(&p->used_at, __ATOMIC_ACQUIRE) : 0;
         plat_mutex_lock(&rl);
         dr_calls[DR_PROG_RELEASE]++, dr_tcalls[DR_PROG_RELEASE]++;
-        if (used && r_submit_done < used) {
+        if (used && r_submit_done < used && (rq_n || r_busy)) {
             uint64_t p0 = perf_begin();
             int away = core_away_unlocked();
-            while (r_submit_done < used) plat_cond_wait(&rcv, &rl);
+            while (r_submit_done < used && (rq_n || r_busy)) plat_cond_wait(&rcv, &rl);
             wait_counted(DR_PROG_RELEASE, p0);
             core_back_unlocked(&away);
         }

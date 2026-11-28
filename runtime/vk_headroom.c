@@ -74,7 +74,9 @@ static int room(const VkCtx *c, uint32_t type, VkDeviceSize block) {
     VmaBudget b[VK_MAX_MEMORY_HEAPS];
     vmaGetHeapBudgets(c->vma, b);
     const VmaBudget *h = &b[c->mem_props.memoryTypes[type].heapIndex];
-    return h->budget && h->usage + 2 * block <= h->budget / 100 * 85 && vk_mem_host_room() >= 4 * block;
+    // On <= 6 GiB VRAM budgets drop spare headroom blocks earlier (70%) so mirrors (88% cutoff) & textures keep room.
+    VkDeviceSize pct = h->budget <= (6ull << 30) ? 70 : 85;
+    return h->budget && h->usage + 2 * block <= h->budget / 100 * pct && vk_mem_host_room() >= 4 * block;
 }
 
 static void drop_anchor(const VkCtx *c, VmaAllocation *anchor) {
@@ -160,7 +162,7 @@ void vk_headroom_pool(VmaPool pool, uint32_t type, VkDeviceSize block) {
 void vk_headroom_hint(VkDeviceSize bytes) {
     if (!H.started || !H.pool || !bytes) return;
     int64_t after = plat_add64(&H.pool_hint, (int64_t)bytes);
-    if ((after >> 24) != ((after - (int64_t)bytes) >> 24)) {   // every 16 MiB of new textures
+    if ((after >> 25) != ((after - (int64_t)bytes) >> 25)) {   // every 32 MiB of new textures
         plat_or64(&H.types, (int64_t)(1ull << H.pool_type));
         plat_event_set(&H.ev);
     }

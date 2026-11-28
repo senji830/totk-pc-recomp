@@ -3101,8 +3101,8 @@ static Batch *inflight;
 static int ninflight, cap_inflight;
 static Batch *spare;                  // completed batches whose command buffer and fence are reused
 static int nspare, cap_spare;
-#define SCR_SLAB (32ull << 20)        // reusable device-local scratch slab (two fit inside one SCR_BLOCK of 64 MiB)
-#define SCR_KEEP_SLABS 2              // spare slabs kept warm between upload batches (0 extra VRAM beyond scr_pool)
+#define SCR_SLAB (8ull << 20)         // reusable device-local scratch slab (eight fit inside one SCR_BLOCK of 64 MiB)
+#define SCR_KEEP_SLABS 2              // spare slabs kept warm (16 MiB inside scr_pool's existing 64 MiB block)
 static ScratchBuf *spare_scr;
 static int nspare_scr, cap_spare_scr;
 static uint64_t next_seq, done_seq;   // batches handed out / completed (all batches up to done_seq)
@@ -3488,7 +3488,18 @@ static void tex_pool_init(VkCtx *c, const VkImageCreateInfo *ci) {
     plat_once(&cmd_once, cmd_init, NULL);
     plat_rmutex_lock(&cmd_lock);
     if (!tex_pool_tried) {
-        tex_block = (VkDeviceSize)cfg_int("TOTK_TEX_BLOCK_MIB") << 20;   // schema default 64
+        if (cfg_get("TOTK_TEX_BLOCK_MIB")) {
+            tex_block = (VkDeviceSize)cfg_int("TOTK_TEX_BLOCK_MIB") << 20;
+        } else {
+            // On <= 6 GiB GPUs, 32 MiB texture blocks cut VMA fragmentation waste in half and return large (>= 8 MiB)
+            // uncompressed RGBA8 ASTC textures directly to the driver on release.
+            VkDeviceSize vram = 0;
+            for (uint32_t h = 0; h < c->mem_props.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
+                if (c->mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT &&
+                    c->mem_props.memoryHeaps[h].size > vram)
+                    vram = c->mem_props.memoryHeaps[h].size;
+            tex_block = (vram && vram <= (6656ull << 20) ? 32ull : 64ull) << 20;
+        }
         VmaAllocationCreateInfo aci = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         VmaPoolCreateInfo pi = {.blockSize = tex_block};
         if (tex_block && vmaFindMemoryTypeIndexForImageInfo(c->vma, ci, &aci, &tex_type) == VK_SUCCESS) {

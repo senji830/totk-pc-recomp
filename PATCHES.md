@@ -117,7 +117,7 @@ All original TotK Recomp code, architecture, lifter, runtime, installer, and doc
   - **Chunked replay visual bug fixes (`replay_workers > 0`):** Make `wr_seq` chunk-order-aware (`wr_epoch`, `wr_pos`, `prev_wr_seq`, `wr_after()`) and restrict live-entry redirects in `slot_resolve()` to sampler-only descriptors (`!e->wr_seq`), fixing title-screen floating green particle flicker and sun flicker under multi-worker replay.
   - **Default `replay_workers = auto`:** Scale chunked replay workers automatically by logical CPU count (`4` on `>= 12` threads, `2` on `8–11`, `0` on `< 8` so 4-core CPUs do not contend with game threads).
   - **Eliminate pipeline wait budget overruns & heavy autosave spikes:** Disallow `lib_steal()` on budgeted draws (`wait_ms < 1000`, restricting stealing to `one-shot` draws only so cold 60–90 ms shaders never blow past the 8 ms / 25 ms budget) and lengthen heavy pipeline cache autosaves to 15 min (`>= 64` new pipelines, 30 min fallback, 5 min in menu).
-  - **Fast Loading (`fast_load = 1`, default on, 1.4.3 with `realtime = 1`):** Temporarily raise the pacer cap to `120 fps` strictly while `LoadingFade_00` (fast travel, shrine entry/exit, save loads) or `EventFade_00` (pre/post-cutscene black fades) is open, then snap the 5-frame step average cleanly back to `fps_limit` on exit.
+  - **Fast Loading (`fast_load = 0`, optional, 1.4.3 with `realtime = 1`):** Temporarily raise the pacer cap to `120 fps` strictly while `LoadingFade_00` (fast travel, shrine entry/exit, save loads) or `EventFade_00` (pre/post-cutscene black fades) is open, then snap the 5-frame step average cleanly back to `fps_limit` on exit.
 
 ### 13. Upstream `0.5.1` (`889da4e7`) Sync + Smooth New-Shader & Ultrahand Handling (`0.5.4`)
 - **Files:** Upstream `0.5.1` merge (`889da4e7`) + `runtime/gfx_shader.c`, `runtime/vk_exec_draw.c`, `runtime/vk_pipeline.c`, `runtime/cfg.c`
@@ -140,7 +140,15 @@ All original TotK Recomp code, architecture, lifter, runtime, installer, and doc
   - **Targeted `program_release` waits:** Track each `prog_t`'s last queued submit sequence (`used_at`, including cross-recording `carried_prog`) in `nvn_submit_prepare_async()` and wait in `vk_be_program_release()` only when `used && r_submit_done < used`.
   - **Targeted overlapping-pool waits (`replay_wait_pending()`):** Wake callers in `vk_be_pool_init`, `read_texels`, `write_texels`, and `guest_read` as soon as the overlapping pending `RI_POOL_FINI`/`RI_WRITE_TEXELS` finishes instead of draining the entire replay queue.
   - **Reusable device-local scratch arena & zero-copy GPU ASTC:** Sub-allocate upload scratch from reusable 32 MiB slabs (`vk_scratch_alloc()`, keeping up to 2 slabs inside `scr_pool`'s existing 64 MiB block, recycled on batch retire) and bind GPU-deswizzled scratch directly into `vk_astc_record_ex(..., src_device=1)` without extra `cap_in` allocation or `vkCmdCopyBuffer`.
-  - **Proactive VRAM headroom wakeup (`vk_headroom_hint()`):** Wake the headroom background allocator every 16 MiB allocated in `tex_pool` so the next 64 MiB VRAM block is ready ahead of texture bursts.
+  - **Proactive VRAM headroom wakeup (`vk_headroom_hint()`):** Wake the headroom background allocator every 32 MiB allocated in `tex_pool` so the next VRAM block is ready ahead of texture bursts.
+
+### 15. 6 GB VRAM Footprint Optimization, Chunked-Replay Shrine Floor Fix & `fast_load` Default Off
+- **Files:** `runtime/vk_memory.c`, `runtime/vk_texture.c`, `runtime/vk_headroom.c`, `runtime/vk_backend.c`, `runtime/vk_exec_draw.c`, `runtime/cfg.c`, `totk.ini.example`
+- **Fix:**
+  - **6 GB VRAM optimization (works cleanly even with `astc_bc = 0`):** Shrink `SCR_SLAB` from `32 MiB` to `8 MiB` (8 slabs fit inside `scr_pool`'s single `64 MiB` block, keeping 2 slabs = `16 MiB` warm), auto-select `32 MiB` `tex_pool` blocks on `<= 6 GiB` GPUs (cutting VMA block fragmentation in half and giving `>= 8 MiB` uncompressed ASTC textures dedicated allocations that return immediately on release), lower `vk_headroom` cap to `70%` on `<= 6 GiB` budgets, and tighten `<= 6 GiB` released-texture reclamation (`TOTK_TEX_RELEASED_MIB=96`, `TOTK_TEX_VRAM_PRESSURE=78%`, `DEAD_AGE=10 s`, `CLEAN_AGE=3 s` under pressure, step `64`).
+  - **Deadlock-proof `vk_be_program_release()`:** Guard wait loop with `&& (rq_n || r_busy)` so program release can never block when the async replay queue is empty.
+  - **Shrine floor `R32_SFLOAT` feedback snapshot under chunked replay (`replay_workers > 0`):** Move per-draw feedback state (`fb_reads`, `fb_nreads`, `fb_reads_sig`, `fb_pass_snap`) into per-worker `VkExecDraw` (`ex->draw`), protect shared `feedback_copies` / `feedback_cutouts` with `fb_lock` and per-submission `owner`/`owner_fence`, and remove the `!ex->chunked` guard so shrine floor flickering black squares are fixed with full multi-worker parallel recording and ~8 MiB reused VRAM.
+  - **Default `fast_load = 0`:** Disable automatic 120 fps loading-screen speedup by default (`cfg.c`, `totk.ini.example`) to avoid unnecessary transition frame-time spikes while keeping it available as an optional toggle.
 
 ---
 

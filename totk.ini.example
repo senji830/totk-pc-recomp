@@ -20,7 +20,7 @@
 # Fast loading (game 1.4.3, needs realtime = 1): temporarily raises the frame limit to 120 fps while a loading or
 # event fade screen (LoadingFade_00 / EventFade_00) is open, speeding up fast travel, save loads and post-cutscene
 # transitions when fps_limit is lower than 120, then returns immediately to fps_limit. Takes effect at once.
-# fast_load = 1
+# fast_load = 0
 # Frame queue: the game starts a frame while the previous one waits for its display time, so a frame that runs long
 # still makes its turn. Far fewer dropped frames at the limit for up to one frame more input delay. Takes effect at once.
 # frame_queue = 0
