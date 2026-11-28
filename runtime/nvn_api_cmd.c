@@ -416,8 +416,23 @@ void nvn_pins_stats(uint64_t *live, uint64_t *freed) {
 // (copy_block), 0 for a plain heap block; hw: the recording's command memory as the real driver counts it (set at
 // EndRecording), what CopyCommands of it adds to nvnCommandBufferGetCommandMemoryUsed (inline_recording); fsync: 1 when
 // the records hold an OP_FENCE_SYNC (flatten_recording), which nvn_submit_fence_syncs signals at submit
-typedef struct { uint64_t magic, bytes, made_at, used_at, deferred, pins, cap, hw, fsync; const tex_t **pin_v; } copy_prefix;
+typedef struct {
+    uint64_t magic, bytes, made_at, used_at, deferred, pins, cap, hw, fsync;
+    const tex_t **pin_v;
+    uint64_t progs, draw_before_prog;
+    prog_t **prog_v;
+    prog_t *prog_last;
+} copy_prefix;
 _Static_assert(sizeof(copy_prefix) % 8 == 0, "records stay 8-byte aligned");
+static PlatMutex prog_carry_lock = PLAT_MUTEX_INIT;
+static prog_t *carried_prog;   // last program bound by a submitted async command buffer (cleared on prog_release)
+
+void nvn_prog_release_notify(const prog_t *p) {
+    if (!p) return;
+    plat_mutex_lock(&prog_carry_lock);
+    if (carried_prog == p) carried_prog = NULL;
+    plat_mutex_unlock(&prog_carry_lock);
+}
 typedef struct { uintptr_t lo, hi; uint8_t *copy; } cmd_copy;
 typedef struct { cmd_copy *v; uint32_t n, cap; } copy_bucket;
 static PlatMutex copy_lock = PLAT_MUTEX_INIT;    // guards the two maps, the counters and every prefix
@@ -521,6 +536,7 @@ static void copy_pins_ref(const copy_prefix *pf, int delta) {
 static void copy_free(copy_prefix *pf) {
     copy_pins_ref(pf, -1);
     free((void *)pf->pin_v);
+    free(pf->prog_v);
     copy_block_free(pf);
 }
 
@@ -598,8 +614,13 @@ static uint8_t *flatten_recording(const uint8_t *p, size_t n) {
     uint8_t *out = (uint8_t *)block;
     memcpy(out + sizeof(copy_prefix), p, n);
     static __thread struct { const tex_t **v; uint64_t cap; } named;   // the pins of this recording, reused
-    uint64_t pins_named = 0;
-    int listed = 1;   // 0 after a failed growth: the copy goes without a list
+    static __thread struct { prog_t **v; uint64_t cap; } named_p;      // unique bound programs of this recording, reused
+    static __thread struct { prog_t *p; uint32_t gen; } pseen[256];    // fast dedup filter per recording
+    static __thread uint32_t pgen;
+    if (++pgen == 0) memset(pseen, 0, sizeof pseen), pgen = 1;
+    uint64_t pins_named = 0, progs_named = 0;
+    int listed = 1, plist = 1, seen_prog = 0, draw_before_prog = 0;
+    prog_t *prog_last = NULL;
     // Looked for only once some recording held the op (fence_sync_recorded): the game's own recordings never do.
     int find_fsync = __atomic_load_n(&fence_sync_recorded, __ATOMIC_RELAXED), fsync = 0;
     for (size_t at = 0;;) {   // the records stay checked: a corrupt one stops here, not in the replay
@@ -608,8 +629,30 @@ static uint8_t *flatten_recording(const uint8_t *p, size_t n) {
         if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_ || h.op == OP_JUMP || h.op == OP_CALL || at + h.size > n ||
             (!at && h.op != OP_BEGIN))
             rt_fatal("nvn: corrupt recording at %p (op %u size %u)", (const void *)(p + at), h.op, h.size);
+        const void *pl = out + sizeof(copy_prefix) + at + 8;
+        if (h.op == OP_BIND_PROGRAM) {
+            prog_t *pr = (prog_t *)(uintptr_t)((const p_bind_program *)pl)->prog;
+            seen_prog = 1;
+            prog_last = pr;
+            if (pr && plist) {
+                uint32_t slot = (uint32_t)((uintptr_t)pr * 0x9E3779B97F4A7C15ull >> 56);
+                if (pseen[slot].gen != pgen || pseen[slot].p != pr) {
+                    pseen[slot].gen = pgen, pseen[slot].p = pr;
+                    if (progs_named == named_p.cap) {
+                        uint64_t cap = named_p.cap ? named_p.cap * 2 : 64;
+                        prog_t **v = realloc(named_p.v, sizeof *v * cap);
+                        if (v) named_p.v = v, named_p.cap = cap;
+                        else plist = 0;
+                    }
+                    if (plist) named_p.v[progs_named++] = pr;
+                }
+            }
+        } else if (!seen_prog && (h.op == OP_DRAW || h.op == OP_DRAW_IDX || h.op == OP_DRAW_IDX_IND ||
+                                  h.op == OP_DISPATCH || h.op == OP_DISPATCH_IND)) {
+            draw_before_prog = 1;
+        }
         const tex_t *pinned[9];
-        int k = op_pins(h.op, out + sizeof(copy_prefix) + at + 8, pinned);
+        int k = op_pins(h.op, pl, pinned);
         for (int i = 0; i < k; i++) pin_ref(pinned[i], 1, 0);
         if (k && listed && pins_named + (uint64_t)k > named.cap) {
             uint64_t cap = named.cap ? named.cap * 2 : 64;
@@ -630,8 +673,13 @@ static uint8_t *flatten_recording(const uint8_t *p, size_t n) {
     const tex_t **pin_v = NULL;
     if (pins_named && listed && (pin_v = malloc(sizeof *pin_v * pins_named)))
         memcpy((void *)pin_v, (const void *)named.v, sizeof *pin_v * pins_named);
+    prog_t **prog_v = NULL;
+    if (progs_named && plist && (prog_v = malloc(sizeof *prog_v * progs_named)))
+        memcpy(prog_v, named_p.v, sizeof *prog_v * progs_named);
+    else if (progs_named) progs_named = 0;
     *block = (copy_prefix){.magic = COPY_MAGIC, .bytes = n, .pins = pins_named, .cap = block->cap, .fsync = (uint64_t)fsync,
-                           .pin_v = pin_v};
+                           .pin_v = pin_v, .progs = progs_named, .draw_before_prog = (uint64_t)draw_before_prog,
+                           .prog_v = prog_v, .prog_last = prog_last};
     return out + sizeof(copy_prefix);
 }
 
@@ -1331,12 +1379,23 @@ void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
     uint64_t replayed = gfx_replayed_submits();
     plat_mutex_lock(&copy_lock);
     if (nzombies) zombie_sweep(replayed);
+    int bound_in_sub = 0;
+    plat_mutex_lock(&prog_carry_lock);
     for (int i = 0; i < n; i++) {
         copy_prefix *pf = copy_find(handles[i]);
         if (!pf) {
+            plat_mutex_unlock(&prog_carry_lock);
             plat_mutex_unlock(&copy_lock);
             rt_fatal("nvn: QueueSubmitCommands: command handle %#llx is not a live recording (released or never recorded)",
                      (unsigned long long)handles[i]);
+        }
+        if (!bound_in_sub && pf->draw_before_prog && carried_prog)
+            __atomic_store_n(&carried_prog->used_at, now, __ATOMIC_RELEASE);
+        for (uint64_t k = 0; k < pf->progs; k++)
+            __atomic_store_n(&pf->prog_v[k]->used_at, now, __ATOMIC_RELEASE);
+        if (pf->prog_last || pf->progs) {
+            carried_prog = pf->prog_last;
+            bound_in_sub = 1;
         }
         out[i] = handles[i];
         if (pf->used_at > replayed && pf->used_at != now && pf->deferred != 1) {
@@ -1345,6 +1404,8 @@ void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
             memcpy(cl, pf, sizeof *pf + pf->bytes);
             cl->cap = cap;
             cl->pin_v = NULL;
+            cl->prog_v = NULL;
+            cl->progs = 0;
             if (pf->pin_v && (cl->pin_v = malloc(sizeof *cl->pin_v * pf->pins)))
                 memcpy((void *)cl->pin_v, (const void *)pf->pin_v, sizeof *cl->pin_v * pf->pins);
             copy_pins_ref(cl, 1);
@@ -1357,6 +1418,7 @@ void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
             pf->used_at = now;
         }
     }
+    plat_mutex_unlock(&prog_carry_lock);
     plat_mutex_unlock(&copy_lock);
     dead_free();
     for (int i = 0; i < n; i++) {

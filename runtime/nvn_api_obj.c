@@ -413,9 +413,14 @@ NVN_API(nvnProgramInitialize) {
     o->magic = NVN_PROG_MAGIC;
     ret_x(c, 1);
 }
+__attribute__((weak)) void nvn_prog_release_notify(const prog_t *p) { (void)p; }
 static void prog_release(prog_t *o) {
-    if (o->serial) gfx_backend()->program_release(o);
+    if (o->serial) {
+        nvn_prog_release_notify(o);
+        gfx_backend()->program_release(o);
+    }
     o->serial = 0;
+    o->used_at = 0;
 }
 // void nvnProgramFinalize(NVNprogram *p)
 NVN_API(nvnProgramFinalize) {

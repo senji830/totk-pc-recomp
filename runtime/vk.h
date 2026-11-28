@@ -418,8 +418,12 @@ void vk_defer_buffer(VkBuffer buf, VmaAllocation alloc);
 void vk_defer_free(void *p);
 // Device-local scratch for the upload batch (storage, transfer src and dst), from a pool of its own (vk_memory.c).
 VkResult vk_scratch_buffer(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc);
+// Sub-allocated slice of a reusable device-local scratch slab owned by the open upload batch (no per-texture
+// VkBuffer create/destroy). Must be called between vk_upload_begin and vk_upload_end.
+VkResult vk_scratch_alloc(VkDeviceSize size, VkDeviceSize align, VkBuffer *buf, VkDeviceSize *off);
 // A game texture's image with memory of its own: the texture pool, or a dedicated allocation (vk_memory.c).
 VkResult vk_texture_image(const VkImageCreateInfo *ci, VkImage *img, VmaAllocation *alloc);
+void vk_headroom_hint(VkDeviceSize bytes);   // wakes headroom proactively during texture streaming bursts
 // Staging and scratch bytes the open upload batch holds until it completes. Large texture loads submit the batch early
 // (vk_texture.c UPLOAD_HELD_MAX) so the GPU starts on it and its buffers come back before the pools need new blocks.
 VkDeviceSize vk_upload_held(void);
@@ -442,6 +446,11 @@ typedef struct { VkDeviceSize src; uint32_t w, h, slices, level, layer; VkOffset
 // 0 when the decoder is unavailable or the scratch buffer cannot be allocated (nothing recorded).
 int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, const VkAstcRegion *rg, int n, uint32_t bw,
                    uint32_t bh, int srgb, int bc, VkImage img, VkImageAspectFlags aspect, VkBuffer readback);
+// Extended variant: src_off is the base offset inside src; src_device=1 means src is already a device-local storage
+// buffer (e.g. from GPU deswizzle) and is read directly by the ASTC compute shader without copying to a second buffer.
+int vk_astc_record_ex(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_off, VkDeviceSize src_size, int src_device,
+                      const VkAstcRegion *rg, int n, uint32_t bw, uint32_t bh, int srgb, int bc, VkImage img,
+                      VkImageAspectFlags aspect, VkBuffer readback);
 void vk_astc_stats(uint64_t *dispatches, uint64_t *texels);   // since start
 // TOTK_ASTC_TIME=1: GPU timestamps around each vk_astc_record's dispatches (logged per footprint and the largest one)
 void vk_astc_time_enable(int on);
@@ -462,7 +471,7 @@ typedef struct {
 // dst (device-local, dst_size bytes). The caller records the barriers around it. 0 when nothing was recorded: no
 // pipeline, src_off not 16-byte aligned, a range over the device's storage-buffer limit, a region outside the ranges.
 int vk_deswz_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_off, VkDeviceSize src_size, VkBuffer dst,
-                    VkDeviceSize dst_size, const VkDeswzRegion *rg, int n);
+                    VkDeviceSize dst_off, VkDeviceSize dst_size, const VkDeswzRegion *rg, int n);
 // 1 when vk_deswz_record will take these regions (their dst offsets aside) with destinations of up to max_dst bytes.
 int vk_deswz_fits(VkDeviceSize src_off, VkDeviceSize src_size, const VkDeswzRegion *rg, int n, VkDeviceSize max_dst);
 void vk_deswz_release(void);            // vk_device.c, before the device goes

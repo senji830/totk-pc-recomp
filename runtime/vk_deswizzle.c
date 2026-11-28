@@ -123,7 +123,7 @@ int vk_deswz_fits(VkDeviceSize src_off, VkDeviceSize src_size, const VkDeswzRegi
 }
 
 int vk_deswz_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_off, VkDeviceSize src_size, VkBuffer dst,
-                    VkDeviceSize dst_size, const VkDeswzRegion *rg, int n) {
+                    VkDeviceSize dst_off, VkDeviceSize dst_size, const VkDeswzRegion *rg, int n) {
     VkCtx *c = vk_ctx();
     if (!vk_deswz_fits(src_off, src_size, rg, n, dst_size)) return 0;
     for (int i = 0; i < n; i++)
@@ -134,7 +134,7 @@ int vk_deswz_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_off, VkDe
     if (!pipe) return 0;
     VkDeviceSize lo = src_lo(c, src_off), range = src_off + src_size - lo;
     uint32_t maxg = max_groups_x(c);
-    VkDescriptorBufferInfo dbi[2] = {{src, lo, range}, {dst, 0, dst_size}};
+    VkDescriptorBufferInfo dbi[2] = {{src, lo, range}, {dst, dst_off, dst_size}};
     VkWriteDescriptorSet w[2];
     for (int i = 0; i < 2; i++)
         w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = (uint32_t)i,

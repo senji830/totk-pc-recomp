@@ -1120,8 +1120,8 @@ static int upload_gpu(Tex *e) {
             size += out;
         }
         VkBuffer sb;
-        VmaAllocation sa;
-        if (vk_scratch_buffer(size, &sb, &sa) != VK_SUCCESS) {
+        VkDeviceSize sb_off = 0;
+        if (vk_scratch_alloc(size, 0, &sb, &sb_off) != VK_SUCCESS) {
             log_limited(&n_scratch_fail, "texture %#llx: deswizzle scratch of %llu bytes failed%s",
                         (unsigned long long)e->pub.addr, (unsigned long long)size,
                         k0 ? "; its later levels left as they were" : "; deswizzled on the CPU");
@@ -1132,33 +1132,37 @@ static int upload_gpu(Tex *e) {
             }
             break;
         }
-        if (!vk_deswz_record(cb, sp.buffer, sp.offset, t->L.size, sb, size, dr + k0, (int)(k1 - k0))) {
+        if (!vk_deswz_record(cb, sp.buffer, sp.offset, t->L.size, sb, sb_off, size, dr + k0, (int)(k1 - k0))) {
             log_limited(&n_bad, "texture %#llx: deswizzle of levels %u-%u not recorded; left as they were",
                         (unsigned long long)e->pub.addr, k0, k1 - 1);   // vk_deswz_fits passed: not expected
-            vk_defer_buffer(sb, sa);
             break;
         }
-        barrier(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
         if (agpu) {
+            VkPipelineStageFlags2 dst_st = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                           (mode == VK_DESWZ_CHECK ? VK_PIPELINE_STAGE_2_COPY_BIT : 0);
+            VkAccessFlags2 dst_ac = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                                    (mode == VK_DESWZ_CHECK ? VK_ACCESS_2_TRANSFER_READ_BIT : 0);
+            barrier(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, dst_st, dst_ac);
             uint64_t a0 = perf_begin();
-            if (!vk_astc_record(cb, sb, size, ar + k0, (int)(k1 - k0), e->f.astc_bw, e->f.astc_bh, e->f.astc_srgb,
-                                e->f.astc_bc, e->pub.image, e->pub.aspect, VK_NULL_HANDLE))
+            if (!vk_astc_record_ex(cb, sb, sb_off, size, 1, ar + k0, (int)(k1 - k0), e->f.astc_bw, e->f.astc_bh,
+                                   e->f.astc_srgb, e->f.astc_bc, e->pub.image, e->pub.aspect, VK_NULL_HANDLE))
                 log_limited(&n_undecoded, "ASTC texture %#llx (fmt %#x %ux%u) not decoded on the GPU: left as it was",
                             (unsigned long long)e->pub.addr, d->format, d->width, d->height);
             perf_end(PERF_ASTC, a0);
         } else {
+            barrier(cb, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+            for (uint32_t j = k0; j < k1; j++) rg[j].bufferOffset += sb_off;
             vkCmdCopyBufferToImage(cb, sb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, k1 - k0, rg + k0);
         }
         if (mode == VK_DESWZ_CHECK) {   // the linear copy back to the host, compared with the CPU deswizzle
             VkBuffer rb;
             VmaAllocation ra;
             const uint8_t *rmap = vk_staging(size, &rb, &ra);
-            VkBufferCopy cp = {0, 0, size};
+            VkBufferCopy cp = {sb_off, 0, size};
             vkCmdCopyBuffer(cb, sb, rb, 1, &cp);
             barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT,
                     VK_ACCESS_2_HOST_READ_BIT);
-            vk_defer_buffer(sb, sa);
             vk_upload_end();
             vk_upload_flush(1);
             vmaInvalidateAllocation(c->vma, ra, 0, VK_WHOLE_SIZE);
@@ -1198,7 +1202,6 @@ static int upload_gpu(Tex *e) {
                     VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
             continue;
         }
-        vk_defer_buffer(sb, sa);
         if (k1 < n && vk_upload_held() > UPLOAD_HELD_MAX) {   // submit what is recorded, go on in a new batch
             barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                     VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, ALL_RW);

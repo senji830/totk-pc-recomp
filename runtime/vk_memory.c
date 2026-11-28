@@ -3075,12 +3075,17 @@ void vk_mem_class_log(const VkPhysicalDeviceProperties *p, const VkPhysicalDevic
 
 // ---------------------------------------------------------------- upload batches and deferred destruction
 typedef struct { VkBuffer buf; VmaAllocation alloc; } Staging;
+typedef struct { VkBuffer buf; VmaAllocation alloc; VkDeviceSize size; int slab; } ScratchBuf;
 typedef struct {
     VkCommandBuffer cb;
     VkFence fence;
     uint64_t seq;
     Staging *stg;
     int nstg, cap;
+    ScratchBuf *scr;
+    int nscr, cap_scr;
+    VkBuffer cur_scr;
+    VkDeviceSize cur_off, cur_size;
     VkDeviceSize held;   // staging and scratch bytes freed when the batch completes (vk_upload_held)
 } Batch;
 
@@ -3096,6 +3101,10 @@ static Batch *inflight;
 static int ninflight, cap_inflight;
 static Batch *spare;                  // completed batches whose command buffer and fence are reused
 static int nspare, cap_spare;
+#define SCR_SLAB (32ull << 20)        // reusable device-local scratch slab (two fit inside one SCR_BLOCK of 64 MiB)
+#define SCR_KEEP_SLABS 2              // spare slabs kept warm between upload batches (0 extra VRAM beyond scr_pool)
+static ScratchBuf *spare_scr;
+static int nspare_scr, cap_spare_scr;
 static uint64_t next_seq, done_seq;   // batches handed out / completed (all batches up to done_seq)
 static Dead *dead;
 static int ndead, cap_dead;
@@ -3119,6 +3128,26 @@ static void free_staging(VkCtx *c, Batch *b) {
     b->nstg = 0;
 }
 
+static void free_scratch(VkCtx *c, Batch *b, int keep) {
+    for (int i = 0; i < b->nscr; i++) {
+        ScratchBuf s = b->scr[i];
+        if (keep && s.slab && nspare_scr < SCR_KEEP_SLABS) {
+            if (nspare_scr == cap_spare_scr) grow((void **)&spare_scr, &cap_spare_scr, sizeof *spare_scr);
+            spare_scr[nspare_scr++] = s;
+        } else {
+            vmaDestroyBuffer(c->vma, s.buf, s.alloc);
+        }
+    }
+    b->nscr = 0;
+    b->cur_scr = VK_NULL_HANDLE;
+    b->cur_off = b->cur_size = 0;
+}
+
+static void free_spare_scratch(VkCtx *c) {
+    for (int i = 0; i < nspare_scr; i++) vmaDestroyBuffer(c->vma, spare_scr[i].buf, spare_scr[i].alloc);
+    nspare_scr = 0;
+}
+
 // Batches complete in submission order (one queue): retire from the front while their fences are signalled.
 static void retire(VkCtx *c, int wait_all) {
     int k = 0;
@@ -3127,6 +3156,7 @@ static void retire(VkCtx *c, int wait_all) {
         if (wait_all) vkWaitForFences(c->device, 1, &b->fence, VK_TRUE, UINT64_MAX);
         else if (vkGetFenceStatus(c->device, b->fence) != VK_SUCCESS) break;
         free_staging(c, b);
+        free_scratch(c, b, !wait_all);
         done_seq = b->seq;
         if (nspare == cap_spare) grow((void **)&spare, &cap_spare, sizeof *spare);
         spare[nspare++] = *b;
@@ -3176,6 +3206,7 @@ VkCommandBuffer vk_upload_begin(void) {
     if (nspare) {
         Batch s = spare[--nspare];
         open_b.cb = s.cb, open_b.fence = s.fence, open_b.stg = s.stg, open_b.cap = s.cap;
+        open_b.scr = s.scr, open_b.cap_scr = s.cap_scr;
         vkResetCommandBuffer(open_b.cb, 0);
         vkResetFences(c->device, 1, &open_b.fence);
     } else {
@@ -3326,7 +3357,7 @@ void vk_mem_shadow_prologue(VkCommandBuffer cb, uint64_t fence) {
 static VmaPool scr_pool;
 static int scr_pool_tried;
 
-VkResult vk_scratch_buffer(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc) {
+static VkResult scratch_buf_create(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc) {
     VkCtx *c = vk_ctx();
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size ? size : 16,
                              .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
@@ -3355,9 +3386,82 @@ VkResult vk_scratch_buffer(VkDeviceSize size, VkBuffer *buf, VmaAllocation *allo
         plat_rmutex_unlock(&cmd_lock);
     }
     if (scr_pool && bi.size <= SCR_BLOCK / 2) aci.pool = scr_pool;
-    VkResult r = vmaCreateBuffer(c->vma, &bi, &aci, buf, alloc, NULL);
-    if (r == VK_SUCCESS && open_active) open_b.held += bi.size;   // the caller defers its free to the open batch
+    return vmaCreateBuffer(c->vma, &bi, &aci, buf, alloc, NULL);
+}
+
+VkResult vk_scratch_buffer(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc) {
+    VkResult r = scratch_buf_create(size, buf, alloc);
+    if (r == VK_SUCCESS && open_active) open_b.held += size ? size : 16;   // the caller defers its free to the open batch
     return r;
+}
+
+VkResult vk_scratch_alloc(VkDeviceSize size, VkDeviceSize align, VkBuffer *buf, VkDeviceSize *off) {
+    VkCtx *c = vk_ctx();
+    if (!c) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!size) size = 16;
+    VkDeviceSize al = c->props.limits.minStorageBufferOffsetAlignment;
+    if (al < 256) al = 256;
+    if (align > al) al = align;
+    plat_once(&cmd_once, cmd_init, NULL);
+    plat_rmutex_lock(&cmd_lock);
+    if (!open_active) {
+        VmaAllocation a;
+        VkResult r = scratch_buf_create(size, buf, &a);
+        plat_rmutex_unlock(&cmd_lock);
+        if (r == VK_SUCCESS) {
+            *off = 0;
+            vk_defer_buffer(*buf, a);
+        }
+        return r;
+    }
+    if (open_b.cur_scr) {
+        VkDeviceSize a = (open_b.cur_off + al - 1) / al * al;
+        if (a + size <= open_b.cur_size) {
+            open_b.cur_off = a + size;
+            open_b.held += size;
+            *buf = open_b.cur_scr;
+            *off = a;
+            plat_rmutex_unlock(&cmd_lock);
+            return VK_SUCCESS;
+        }
+    }
+    ScratchBuf s = {0};
+    VkResult r = VK_SUCCESS;
+    if (size <= SCR_SLAB) {
+        if (nspare_scr) {
+            s = spare_scr[--nspare_scr];
+        } else {
+            r = scratch_buf_create(SCR_SLAB, &s.buf, &s.alloc);
+            if (r == VK_SUCCESS) {
+                s.size = SCR_SLAB;
+                s.slab = 1;
+            } else if (size < SCR_SLAB) {
+                r = scratch_buf_create(size, &s.buf, &s.alloc);
+                s.size = size;
+                s.slab = 0;
+            }
+        }
+    } else {
+        r = scratch_buf_create(size, &s.buf, &s.alloc);
+        s.size = size;
+        s.slab = 0;
+    }
+    if (r != VK_SUCCESS) {
+        plat_rmutex_unlock(&cmd_lock);
+        return r;
+    }
+    if (open_b.nscr == open_b.cap_scr) grow((void **)&open_b.scr, &open_b.cap_scr, sizeof *open_b.scr);
+    open_b.scr[open_b.nscr++] = s;
+    if (s.slab) {
+        open_b.cur_scr = s.buf;
+        open_b.cur_size = s.size;
+        open_b.cur_off = size;
+    }
+    open_b.held += size;
+    *buf = s.buf;
+    *off = 0;
+    plat_rmutex_unlock(&cmd_lock);
+    return VK_SUCCESS;
 }
 
 VkDeviceSize vk_upload_held(void) { return open_active ? open_b.held : 0; }
@@ -3409,6 +3513,7 @@ VkResult vk_texture_image(const VkImageCreateInfo *ci, VkImage *img, VmaAllocati
     VkCtx *c = vk_ctx();
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     if (!__atomic_load_n(&tex_pool_tried, __ATOMIC_ACQUIRE)) tex_pool_init(c, ci);
+    VkDeviceSize pooled_bytes = 0;
     if (tex_pool) {
         VkDeviceImageMemoryRequirements q = {.sType = VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS, .pCreateInfo = ci};
         VkMemoryDedicatedRequirements dr = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
@@ -3416,10 +3521,14 @@ VkResult vk_texture_image(const VkImageCreateInfo *ci, VkImage *img, VmaAllocati
         vkGetDeviceImageMemoryRequirements(c->device, &q, &mr);
         if (dr.requiresDedicatedAllocation || dr.prefersDedicatedAllocation || mr.memoryRequirements.size >= tex_block / 4)
             ai.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
-        else if (mr.memoryRequirements.memoryTypeBits >> tex_type & 1)
+        else if (mr.memoryRequirements.memoryTypeBits >> tex_type & 1) {
             ai = (VmaAllocationCreateInfo){.usage = VMA_MEMORY_USAGE_UNKNOWN, .pool = tex_pool};   // the pool's type
+            pooled_bytes = mr.memoryRequirements.size;
+        }
     }
-    return vmaCreateImage(c->vma, ci, &ai, img, alloc, NULL);
+    VkResult r = vmaCreateImage(c->vma, ci, &ai, img, alloc, NULL);
+    if (r == VK_SUCCESS && pooled_bytes) vk_headroom_hint(pooled_bytes);
+    return r;
 }
 
 // At device creation: the staging and scratch pools with their kept blocks, made through a first small buffer each
@@ -3558,7 +3667,14 @@ void vk_mem_collect(void) {
 void vk_oom_release(void) {
     rt_oom_request();
     vk_headroom_release();
-    vk_mem_collect();
+    VkCtx *c = vk_ctx();
+    if (c) {
+        plat_once(&cmd_once, cmd_init, NULL);
+        plat_rmutex_lock(&cmd_lock);
+        free_spare_scratch(c);
+        collect_locked(c);
+        plat_rmutex_unlock(&cmd_lock);
+    }
 }
 
 void vk_mem_stats(VkMemStats *s) {
@@ -3593,8 +3709,12 @@ void vk_mem_shutdown(void) {
     for (int i = 0; i < nspare; i++) {
         vkDestroyFence(c->device, spare[i].fence, NULL);
         free(spare[i].stg);
+        free(spare[i].scr);
     }
     nspare = 0;
+    free_spare_scratch(c);
+    free(spare_scr);
+    spare_scr = NULL, cap_spare_scr = 0;
     if (cmd_pool) vkDestroyCommandPool(c->device, cmd_pool, NULL);
     cmd_pool = VK_NULL_HANDLE;
     if (stg_pool) vmaDestroyPool(c->vma, stg_pool);   // after retire: no staging buffer is left in it

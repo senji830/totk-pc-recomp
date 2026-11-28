@@ -40,6 +40,7 @@ static struct {
     uint32_t pool_type;
     VkDeviceSize pool_block;
     VmaAllocation pool_anchor;
+    volatile int64_t pool_hint;     // bytes allocated in pool; wakes headroom every 16 MiB during bursts
     volatile uint64_t hold_until;   // plat_now_ms before which no spare block is kept (vk_headroom_release)
 } H;
 
@@ -154,6 +155,15 @@ void vk_headroom_pool(VmaPool pool, uint32_t type, VkDeviceSize block) {
     if (c) drop_anchor(c, &H.pool_anchor);
     H.pool = pool, H.pool_type = type, H.pool_block = block;
     plat_mutex_unlock(&H.lock);
+}
+
+void vk_headroom_hint(VkDeviceSize bytes) {
+    if (!H.started || !H.pool || !bytes) return;
+    int64_t after = plat_add64(&H.pool_hint, (int64_t)bytes);
+    if ((after >> 24) != ((after - (int64_t)bytes) >> 24)) {   // every 16 MiB of new textures
+        plat_or64(&H.types, (int64_t)(1ull << H.pool_type));
+        plat_event_set(&H.ev);
+    }
 }
 
 // After a failed allocation: the spare blocks go at once (an empty VMA block takes the next allocation of its type or

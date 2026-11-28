@@ -380,17 +380,13 @@ static void pending_remove_locked(uint64_t id) {   // rl held
 
 // 1 when an entry of kind overlaps [lo, hi): for a teardown also one of the same pool object (vk_memory.c index_put
 // would drop its record unfreed) or, when virt (a texture in a virtual pool), any physical pool, whose memory such
-// textures may sit on (vk_texture_range_gone's alloc test).
-static int pending_over(int kind, uint64_t lo, uint64_t hi, const pool_t *key, int virt) {
-    if (!__atomic_load_n(&pend_any, __ATOMIC_ACQUIRE)) return 0;
-    int hit = 0;
-    plat_mutex_lock(&rl);
-    for (int i = 0; i < npend && !hit; i++) {
+// textures may sit on (vk_texture_range_gone's alloc test). rl held.
+static int pending_over_locked(int kind, uint64_t lo, uint64_t hi, const pool_t *key, int virt) {
+    for (int i = 0; i < npend; i++) {
         const Pending *e = &pend[i];
-        hit = e->kind == kind && ((e->lo < hi && lo < e->hi) || (key && e->key == key) || (virt && e->phys));
+        if (e->kind == kind && ((e->lo < hi && lo < e->hi) || (key && e->key == key) || (virt && e->phys))) return 1;
     }
-    plat_mutex_unlock(&rl);
-    return hit;
+    return 0;
 }
 
 // 1 when a GPU-written mirrored texture over an entry of kind has stale storage: a write-back of all of them
@@ -537,6 +533,22 @@ static void replay_drain(int why) {
     plat_mutex_unlock(&rl);
 }
 
+// Waits only while a pending entry of kind overlaps [lo, hi) (or key / phys), waking as soon as that entry finishes
+// instead of draining newer submissions queued after it.
+static void replay_wait_pending(int why, int kind, uint64_t lo, uint64_t hi, const pool_t *key, int virt) {
+    if (!gfx_replay_async() || !__atomic_load_n(&pend_any, __ATOMIC_ACQUIRE)) return;
+    plat_mutex_lock(&rl);
+    if (pending_over_locked(kind, lo, hi, key, virt)) {
+        dr_calls[why]++, dr_tcalls[why]++;
+        uint64_t p0 = perf_begin();
+        int away = core_away_unlocked();
+        while (pending_over_locked(kind, lo, hi, key, virt)) plat_cond_wait(&rcv, &rl);
+        wait_counted(why, p0);
+        core_back_unlocked(&away);
+    }
+    plat_mutex_unlock(&rl);
+}
+
 // What made the game wait for the replay: since the last line (every 1800 game frames), or over the run (at exit).
 static void replay_log(uint64_t frame, int total) {
     char buf[2048];
@@ -622,7 +634,7 @@ WEAK void vk_program_release(const prog_t *p) { (void)p; }
 static int vk_be_pool_init(pool_t *p) {
     vk_sync_start();
     int rec = p->size && (!(p->flags & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS) || (p->flags & NVN_MEMORY_POOL_FLAGS_PHYSICAL));
-    if (rec && pending_over(PD_FINI, (uintptr_t)p->mem, (uintptr_t)p->mem + p->size, p, 0)) replay_drain(DR_FINI_INIT);
+    if (rec) replay_wait_pending(DR_FINI_INIT, PD_FINI, (uintptr_t)p->mem, (uintptr_t)p->mem + p->size, p, 0);
     return vk_pool_init(p);
 }
 // Queued (TOTK_REPLAY_QUEUE_POOL_FINI): the record is marked dying and stays for the items queued before, the replay
@@ -674,7 +686,24 @@ static void vk_be_texture_release(const tex_t *t) {
     plat_mutex_unlock(&rl);
     replay_enqueue(&it);
 }
-static void vk_be_program_release(const prog_t *p) { replay_drain(DR_PROG_RELEASE); vk_program_release(p); }
+// Wait only until the newest async submission that actually bound p has finished replaying: finalizing unloaded scene
+// programs (thousands during Depths <-> Surface transitions) no longer drains the replay queue when unreferenced.
+static void vk_be_program_release(const prog_t *p) {
+    if (gfx_replay_async()) {
+        uint64_t used = p ? __atomic_load_n(&p->used_at, __ATOMIC_ACQUIRE) : 0;
+        plat_mutex_lock(&rl);
+        dr_calls[DR_PROG_RELEASE]++, dr_tcalls[DR_PROG_RELEASE]++;
+        if (used && r_submit_done < used) {
+            uint64_t p0 = perf_begin();
+            int away = core_away_unlocked();
+            while (r_submit_done < used) plat_cond_wait(&rcv, &rl);
+            wait_counted(DR_PROG_RELEASE, p0);
+            core_back_unlocked(&away);
+        }
+        plat_mutex_unlock(&rl);
+    }
+    vk_program_release(p);
+}
 // Asynchronous: the handles (nvn_submit_prepare_async ran under the front end's submit lock) are copied and queued;
 // the value returned is the one the replay will signal.
 static uint64_t vk_be_submit(const uint64_t *handles, int n) {
@@ -713,8 +742,8 @@ static void vk_be_read_texels(const tex_t *t, const view_t *v, const NVNcopyRegi
     }
     uint64_t lo = (uintptr_t)t->mem, hi = lo + (t->L.size ? t->L.size : 1);
     int virt = (t->pool_flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) != 0;
-    if (pending_over(PD_FINI, lo, hi, NULL, virt)) replay_drain(DR_FINI_TEXELS);   // the entry may be the dying pool's
-    if (pending_over(PD_WRITE, lo, hi, NULL, 0)) replay_drain(DR_WT_READ);        // the image lacks the queued write
+    replay_wait_pending(DR_FINI_TEXELS, PD_FINI, lo, hi, NULL, virt);   // the entry may be the dying pool's
+    replay_wait_pending(DR_WT_READ, PD_WRITE, lo, hi, NULL, 0);         // the image lacks the queued write
     uint64_t f = vk_texture_last_write(t);
     plat_mutex_lock(&rl);
     dr_calls[DR_READ_TEXELS]++, dr_tcalls[DR_READ_TEXELS]++;
@@ -779,8 +808,7 @@ static void vk_be_write_texels(const tex_t *t, const view_t *v, const NVNcopyReg
     int full = pend_bytes > PEND_BYTES_CAP;
     plat_mutex_unlock(&rl);
     if (full) replay_drain(DR_WT_CAP);
-    if (pending_over(PD_FINI, lo, hi, NULL, (t->pool_flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) != 0))
-        replay_drain(DR_FINI_TEXELS);
+    replay_wait_pending(DR_FINI_TEXELS, PD_FINI, lo, hi, NULL, (t->pool_flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) != 0);
     uint64_t bytes = 0;
     VkTexWrite *w = vk_write_texels_begin(t, v, r, src, row, img, &bytes);
     if (!w) return;
@@ -798,8 +826,8 @@ static void vk_be_guest_read(uint64_t addr, uint64_t size) {
     if (gfx_replay_async()) {
         // A write-back of an image a queued teardown drops, or one that lacks a queued write, would put stale texels
         // into storage the game reads: the queue goes first.
-        if (pending_over(PD_FINI, addr, addr + size, NULL, 0)) replay_drain(DR_FINI_WB);
-        if (pending_over(PD_WRITE, addr, addr + size, NULL, 0)) replay_drain(DR_WT_WB);
+        replay_wait_pending(DR_FINI_WB, PD_FINI, addr, addr + size, NULL, 0);
+        replay_wait_pending(DR_WT_WB, PD_WRITE, addr, addr + size, NULL, 0);
         uint64_t f = vk_texture_dirty_fence(addr, size);
         plat_mutex_lock(&rl);
         dr_calls[DR_GUEST_READ]++, dr_tcalls[DR_GUEST_READ]++;

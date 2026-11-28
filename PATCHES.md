@@ -129,6 +129,19 @@ All original TotK Recomp code, architecture, lifter, runtime, installer, and doc
   - **Atomic claim-and-refund pipeline wait budget across `replay_workers` (`9cc9c0f`):** Atomically claim the frame's wait budget before entering `vk_pipeline` and refund unused time after completion so parallel `replay_workers` cannot multiply per-frame wait caps, with a tighter `4 ms` default `geom` cap.
   - **Dedicated urgent GPL library workers & non-stalling full-screen cap (`157dfea`):** Spawn 2 dedicated `lib_worker` threads exclusively for `U.head` urgent GPL libraries (never starved by `A.low`/`A.head` monolithic builds), pause starting new `A.low` monolithic builds while `U.running > 0`, lower default `full-screen` wait budget in `any` mode from `25 ms` to `12 ms`, and mark timed-out pipelines (`wait_timed_out`) so consecutive frames do not re-stall.
 
+### 14. Smooth Depths ↔ Surface Ascend & Heavy Area-Streaming Transitions
+- **Files:** `runtime/nvn_obj.h`, `runtime/nvn_api_obj.c`, `runtime/nvn_api_cmd.c`, `runtime/vk_backend.c`, `runtime/vk.h`, `runtime/vk_memory.c`, `runtime/vk_deswizzle.c`, `runtime/vk_astc.c`, `runtime/vk_texture.c`, `runtime/vk_headroom.c`
+- **Root Cause:** During heavy world-streaming transitions (such as ascending from Depths underneath Korok Forest up to Korok Forest Surface), four bottlenecks combined to cause multi-second stalls and 140–193 ms frame spikes:
+  1. Unloading area shaders called `nvnProgramFinalize()` ~1,582 times; `vk_be_program_release()` unconditionally drained the entire async replay queue even though almost none of those programs were referenced by any queued submission (`2.51 s` cumulative wait).
+  2. `vk_be_pool_init`, `read_texels`, `write_texels`, and `guest_read` called full `replay_drain()` when overlapping a queued `RI_POOL_FINI`/`RI_WRITE_TEXELS`, waiting for newer `RI_SUBMIT`/`RI_PRESENT` frames queued behind the overlapping item (`1.08 s` cumulative wait).
+  3. Korok Forest texture upload bursts (~9,000 ASTC regions + ~11,600 deswizzle regions in one frame) allocated and destroyed two separate `VkBuffer`s per texture via `vmaCreateBuffer`/`vk_defer_buffer` and performed redundant `cap_in` + `vkCmdCopyBuffer` copies after GPU deswizzle.
+  4. `vk_headroom` polled every `500 ms` instead of waking proactively during sudden texture-pool allocation bursts.
+- **Fix:**
+  - **Targeted `program_release` waits:** Track each `prog_t`'s last queued submit sequence (`used_at`, including cross-recording `carried_prog`) in `nvn_submit_prepare_async()` and wait in `vk_be_program_release()` only when `used && r_submit_done < used`.
+  - **Targeted overlapping-pool waits (`replay_wait_pending()`):** Wake callers in `vk_be_pool_init`, `read_texels`, `write_texels`, and `guest_read` as soon as the overlapping pending `RI_POOL_FINI`/`RI_WRITE_TEXELS` finishes instead of draining the entire replay queue.
+  - **Reusable device-local scratch arena & zero-copy GPU ASTC:** Sub-allocate upload scratch from reusable 32 MiB slabs (`vk_scratch_alloc()`, keeping up to 2 slabs inside `scr_pool`'s existing 64 MiB block, recycled on batch retire) and bind GPU-deswizzled scratch directly into `vk_astc_record_ex(..., src_device=1)` without extra `cap_in` allocation or `vkCmdCopyBuffer`.
+  - **Proactive VRAM headroom wakeup (`vk_headroom_hint()`):** Wake the headroom background allocator every 16 MiB allocated in `tex_pool` so the next 64 MiB VRAM block is ready ahead of texture bursts.
+
 ---
 
 ## Rebuilding the Patched Setup Locally
